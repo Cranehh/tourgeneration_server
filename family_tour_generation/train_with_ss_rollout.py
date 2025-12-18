@@ -172,22 +172,31 @@ class ScheduledSamplingTrainer:
             batch = batch_data.to(self.device)
 
             # 使用纯自回归模式验证 (模拟真实推理)
-            predictions = self.model.generate(
+            predictions, pattern_probs = self.model.generate(
                 batch.family_attr, batch.member_attr, batch.member_mask
             )
+            pattern_probs.update({
+                'family_pattern_target': batch.family_pattern,
+                'individual_pattern_target': batch.member_pattern,
+            })
 
             # 调整预测格式以计算损失
             # generate 返回的 purpose, mode 等是索引，需要转换为 logits 格式
             # 这里简化处理，用 teacher forcing 计算损失
-            predictions_tf = self.model(batch, teacher_forcing=True)
-
+            predictions_tf, pattern_probs_tf = self.model(batch, teacher_forcing=True)
+            pattern_probs_tf.update({
+                'family_pattern_target': batch.family_pattern,
+                'individual_pattern_target': batch.member_pattern,
+            })
             loss_tf, losses_tf = self.criterion(
                 predictions_tf, batch.activities,
-                batch.member_mask, batch.activity_mask
+                batch.member_mask, batch.activity_mask,
+                pattern_outputs=pattern_probs_tf
             )
             loss, losses = self.criterion(
                 predictions, batch.activities,
-                batch.member_mask, batch.activity_mask
+                batch.member_mask, batch.activity_mask,
+                pattern_outputs=pattern_probs
             )
 
             # 计算指标 (使用自回归生成的结果)
@@ -367,12 +376,20 @@ def main():
     member_mask_test = member_data_test[:, :, -1] != 0
     activity_mask_test = activity_data_test.sum(axis=-1) != 0
 
+    family_pattern_train = np.load(f'{data_dir}/family_pattern_train.npy')
+    family_pattern_test = np.load(f'{data_dir}/family_pattern_test.npy')
+
+    individual_pattern_train = np.load(f'{data_dir}/person_pattern_train.npy')
+    individual_pattern_test = np.load(f'{data_dir}/person_pattern_test.npy')
+
     train_dataset = FamilyTourDataset(
         family_data_train,
         member_data_train,
         activity_data_train,
         member_mask_train,
-        activity_mask_train
+        activity_mask_train,
+        family_pattern=family_pattern_train,
+        member_pattern=individual_pattern_train
     )
 
     val_dataset = FamilyTourDataset(
@@ -380,7 +397,9 @@ def main():
         member_data_test,
         activity_data_test,
         member_mask_test,
-        activity_mask_test
+        activity_mask_test,
+        family_pattern=family_pattern_test,
+        member_pattern=individual_pattern_test
     )
 
     train_loader = DataLoader(
@@ -408,7 +427,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_morerollout_lesslayer_5',
+        save_dir='../checkpoints_ss_with_condition',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

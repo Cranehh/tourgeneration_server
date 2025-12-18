@@ -14,6 +14,190 @@ from config import ModelConfig
 from embedding import ActivityEmbedding, PositionalEncoding
 
 
+# ==================== 新增：模式条件模块 ====================
+
+class PatternCrossAttention(nn.Module):
+    """
+    模式交叉注意力
+    让解码器从预测的活动模式中提取条件信息
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+            self,
+            hidden: torch.Tensor,
+            pattern_emb: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden: (batch, seq_len, d_model) 解码器隐状态
+            pattern_emb: (batch, d_model) 模式嵌入
+
+        Returns:
+            (batch, seq_len, d_model) 融合模式信息后的隐状态
+        """
+        # 扩展 pattern_emb 作为 key 和 value
+        pattern_kv = pattern_emb.unsqueeze(1)  # (batch, 1, d_model)
+
+        attn_out, _ = self.cross_attn(hidden, pattern_kv, pattern_kv)
+
+        return self.norm(hidden + attn_out)
+
+
+class AdaLNModulation(nn.Module):
+    """
+    Adaptive Layer Normalization (adaLN) 调制
+
+    用模式条件调制 LayerNorm 的 scale 和 shift
+    参考: DiT (Diffusion Transformer)
+    """
+
+    def __init__(self, d_model: int, condition_dim: int):
+        super().__init__()
+
+        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
+
+        # 从条件生成 scale (gamma) 和 shift (beta)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(condition_dim, d_model * 2)
+        )
+
+        # 初始化为恒等映射
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, ..., d_model) 输入
+            condition: (batch, condition_dim) 条件向量
+
+        Returns:
+            (batch, ..., d_model) 调制后的输出
+        """
+        # 生成 scale 和 shift
+        modulation = self.adaLN_modulation(condition)  # (batch, d_model * 2)
+        gamma, beta = modulation.chunk(2, dim=-1)  # 各 (batch, d_model)
+
+        # 扩展到与 x 相同的维度
+        while gamma.dim() < x.dim():
+            gamma = gamma.unsqueeze(1)
+            beta = beta.unsqueeze(1)
+
+        # 应用 adaLN: norm(x) * (1 + gamma) + beta
+        return self.norm(x) * (1 + gamma) + beta
+
+
+class PatternConditionModule(nn.Module):
+    """
+    模式条件模块
+
+    组合交叉注意力和 adaLN 调制
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            num_family_patterns: int = 118,
+            num_individual_patterns: int = 207,
+            dropout: float = 0.1
+    ):
+        super().__init__()
+
+        # 模式嵌入投影
+        self.family_pattern_proj = nn.Linear(num_family_patterns, d_model)
+        self.individual_pattern_proj = nn.Linear(num_individual_patterns, d_model)
+
+        # 模式交叉注意力
+        self.family_pattern_attn = PatternCrossAttention(d_model, num_heads, dropout)
+        self.individual_pattern_attn = PatternCrossAttention(d_model, num_heads, dropout)
+
+        # adaLN 调制 (用组合的模式条件)
+        self.adaLN = AdaLNModulation(d_model, d_model * 2)
+
+        # 融合家庭和个人模式
+        self.pattern_fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model * 2)
+        )
+
+    def forward(
+            self,
+            hidden: torch.Tensor,
+            family_pattern_prob: torch.Tensor,
+            individual_pattern_prob: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden: (batch, seq_len, d_model) 或 (batch, max_members, seq_len, d_model)
+            family_pattern_prob: (batch, num_family_patterns)
+            individual_pattern_prob: (batch, num_individual_patterns) 或 (batch, max_members, num_individual_patterns)
+
+        Returns:
+            调制后的 hidden
+        """
+        # 投影模式概率到嵌入空间
+        family_emb = self.family_pattern_proj(family_pattern_prob)  # (batch, d_model)
+
+        # 处理 individual_pattern_prob 的维度
+        if individual_pattern_prob.dim() == 3:
+            # (batch, max_members, num_patterns) -> 需要逐成员处理
+            batch_size, max_members, _ = individual_pattern_prob.shape
+            individual_emb = self.individual_pattern_proj(individual_pattern_prob)  # (batch, max_members, d_model)
+        else:
+            individual_emb = self.individual_pattern_proj(individual_pattern_prob)  # (batch, d_model)
+
+        # 根据 hidden 的维度决定处理方式
+        if hidden.dim() == 4:
+            # (batch, max_members, seq_len, d_model)
+            batch_size, max_members, seq_len, d_model = hidden.shape
+
+            # 展平处理
+            hidden_flat = hidden.view(batch_size * max_members, seq_len, d_model)
+
+            # 扩展 family_emb
+            family_emb_expanded = family_emb.unsqueeze(1).expand(-1, max_members, -1)
+            family_emb_flat = family_emb_expanded.reshape(batch_size * max_members, d_model)
+
+            # individual_emb 已经是 (batch, max_members, d_model)
+            individual_emb_flat = individual_emb.view(batch_size * max_members, d_model)
+
+            # 交叉注意力
+            hidden_flat = self.family_pattern_attn(hidden_flat, family_emb_flat)
+            hidden_flat = self.individual_pattern_attn(hidden_flat, individual_emb_flat)
+
+            # 融合条件用于 adaLN
+            combined_condition = torch.cat([family_emb_flat, individual_emb_flat], dim=-1)
+            combined_condition = self.pattern_fusion(combined_condition)
+
+            # adaLN 调制
+            hidden_flat = self.adaLN(hidden_flat, combined_condition)
+
+            # 恢复形状
+            hidden = hidden_flat.view(batch_size, max_members, seq_len, d_model)
+
+        else:
+            # (batch, seq_len, d_model)
+            hidden = self.family_pattern_attn(hidden, family_emb)
+            hidden = self.individual_pattern_attn(hidden, individual_emb)
+
+            combined_condition = torch.cat([family_emb, individual_emb], dim=-1)
+            combined_condition = self.pattern_fusion(combined_condition)
+            hidden = self.adaLN(hidden, combined_condition)
+
+        return hidden
+
+
 class CrossRoleAttention(nn.Module):
     """
     跨成员注意力层
@@ -277,6 +461,17 @@ class MTANDecoder(nn.Module):
         
         # 起始token (用于自回归生成的第一步)
         self.start_token = nn.Parameter(torch.randn(1, 1, config.d_model))
+
+        # 新增: 模式条件模块
+        self.use_pattern_condition = getattr(config, 'use_pattern_condition', True)
+        if self.use_pattern_condition:
+            self.pattern_condition = PatternConditionModule(
+                d_model=config.d_model,
+                num_heads=config.num_heads,
+                num_family_patterns=getattr(config, 'num_family_patterns', 118),
+                num_individual_patterns=getattr(config, 'num_individual_patterns', 207),
+                dropout=config.dropout
+            )
     
     def forward(
         self,
@@ -284,7 +479,8 @@ class MTANDecoder(nn.Module):
         family_repr: torch.Tensor,
         target_activities: torch.Tensor,
         member_mask: torch.BoolTensor,
-        activity_mask: torch.BoolTensor
+        activity_mask: torch.BoolTensor,
+        pattern_outputs: Dict[str, torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         训练阶段: Teacher Forcing
@@ -378,6 +574,14 @@ class MTANDecoder(nn.Module):
         nan_decoded = torch.isnan(decoded).sum()
         # 恢复形状
         decoded = decoded.view(batch_size, max_members, max_activities, -1)
+
+        # 新增: 对 decoder 输出进行模式调制
+        if self.use_pattern_condition and pattern_outputs is not None:
+            decoded = self.pattern_condition(
+                decoded,
+                pattern_outputs['family_pattern_prob'],
+                pattern_outputs['individual_pattern_prob']
+            )
         
         # 输出预测
         predictions = self.output_heads(decoded)
@@ -438,7 +642,8 @@ class MTANDecoder(nn.Module):
         member_repr: torch.Tensor,
         family_repr: torch.Tensor,
         member_mask: torch.BoolTensor,
-        max_length: int = None
+        max_length: int = None,
+        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增参数
     ) -> Dict[str, torch.Tensor]:
         """
         推理阶段: 自回归生成
@@ -506,7 +711,17 @@ class MTANDecoder(nn.Module):
                 memory=memory_flat,
                 tgt_mask=causal_mask
             )
-            
+            # 恢复形状
+            decoded = decoded.view(batch_size, max_members, decoded.shape[1], -1)
+
+            # 新增: 对 decoder 输出进行模式调制
+            if self.use_pattern_condition and pattern_outputs is not None:
+                decoded = self.pattern_condition(
+                    decoded,
+                    pattern_outputs['family_pattern_prob'],
+                    pattern_outputs['individual_pattern_prob']
+                )
+            decoded = decoded.view(batch_size * max_members, decoded.shape[2], -1)
             # 取最后一个位置的输出
             last_hidden = decoded[:, -1, :]  # (batch * max_members, d_model)
             last_hidden = last_hidden.view(batch_size, max_members, -1)

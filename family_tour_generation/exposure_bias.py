@@ -247,7 +247,8 @@ class ScheduledSamplingDecoder(nn.Module):
         target_activities: torch.Tensor,
         member_mask: torch.BoolTensor,
         activity_mask: torch.BoolTensor,
-        training: bool = True
+        training: bool = True,
+        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增
     ) -> Dict[str, torch.Tensor]:
         """
         带 Scheduled Sampling 的前向传播
@@ -265,7 +266,9 @@ class ScheduledSamplingDecoder(nn.Module):
         """
         if not training:
             # 推理模式: 纯自回归
-            return self.decoder.generate(member_repr, family_repr, member_mask)
+            return self.decoder.generate(member_repr, family_repr, member_mask,
+            pattern_outputs=pattern_outputs
+            )
         
         # 获取当前 teacher forcing 概率
         tf_prob = self.scheduler.get_teacher_forcing_prob()
@@ -279,13 +282,15 @@ class ScheduledSamplingDecoder(nn.Module):
                 )
             return self.decoder(
                 member_repr, family_repr, activities_input,
-                member_mask, activity_mask
+                member_mask, activity_mask,
+                pattern_outputs=pattern_outputs
             )
         
         # 混合模式: 逐步决定使用真实标签还是预测
         return self._forward_scheduled_sampling(
             member_repr, family_repr, target_activities,
-            member_mask, activity_mask, tf_prob
+            member_mask, activity_mask, tf_prob,
+            pattern_outputs=pattern_outputs
         )
     
     def _forward_scheduled_sampling(
@@ -295,7 +300,8 @@ class ScheduledSamplingDecoder(nn.Module):
         target_activities: torch.Tensor,
         member_mask: torch.BoolTensor,
         activity_mask: torch.BoolTensor,
-        tf_prob: float
+        tf_prob: float,
+        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增
     ) -> Dict[str, torch.Tensor]:
         """
         Scheduled Sampling 前向传播
@@ -355,6 +361,17 @@ class ScheduledSamplingDecoder(nn.Module):
                 memory=memory_flat,
                 tgt_mask=causal_mask
             )
+
+            # 新增: 对 decoder 输出进行模式调制
+            if self.decoder.use_pattern_condition and pattern_outputs is not None:
+                # 恢复形状以便调制
+                decoded_reshaped = decoded.view(batch_size, max_members, seq_len, -1)
+                decoded_reshaped = self.decoder.pattern_condition(
+                    decoded_reshaped,
+                    pattern_outputs['family_pattern_prob'],
+                    pattern_outputs['individual_pattern_prob']
+                )
+                decoded = decoded_reshaped.view(batch_size * max_members, seq_len, -1)
             
             # 取最后位置输出
             last_hidden = decoded[:, -1, :].view(batch_size, max_members, -1)
@@ -541,7 +558,7 @@ class ExposureBiasTrainer:
             losses: 各部分损失
         """
         # 编码
-        member_repr, family_repr = self.model.encoder(
+        member_repr, family_repr, pattern_prob = self.model.encoder(
             batch.family_attr, batch.member_attr, batch.member_mask
         )
         
@@ -549,13 +566,17 @@ class ExposureBiasTrainer:
         predictions = self.ss_decoder(
             member_repr, family_repr, batch.activities,
             batch.member_mask, batch.activity_mask,
-            training=True
+            training=True,
+            pattern_outputs=pattern_prob  # 传递模式概率
         )
-        
+        pattern_prob.update({
+            'family_pattern_target': batch.family_pattern,
+            'individual_pattern_target': batch.member_pattern,
+        })
         # 计算损失
         loss, losses = criterion(
             predictions, batch.activities,
-            batch.member_mask, batch.activity_mask
+            batch.member_mask, batch.activity_mask, pattern_prob
         )
 
         ar_stage = {1:{'prob': 0.3, 'length':2, 'ar_ratio':0.3},

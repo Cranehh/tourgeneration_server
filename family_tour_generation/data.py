@@ -21,6 +21,9 @@ class FamilyTourBatch:
     # ========== 目标值 ==========
     activities: torch.Tensor            # (B, max_members, max_activities, Fa) 活动链
     activity_mask: torch.BoolTensor     # (B, max_members, max_activities) 有效活动标记
+
+    family_pattern: torch.Tensor        # (B, pattern_dim) 家庭活动模式
+    member_pattern: torch.Tensor        # (B, max_members, pattern_dim) 成员
     
     def to(self, device):
         """移动到指定设备"""
@@ -29,7 +32,9 @@ class FamilyTourBatch:
             member_attr=self.member_attr.to(device),
             member_mask=self.member_mask.to(device),
             activities=self.activities.to(device),
-            activity_mask=self.activity_mask.to(device)
+            activity_mask=self.activity_mask.to(device),
+            family_pattern = self.family_pattern.to(device),
+            member_pattern = self.member_pattern.to(device)
         )
     
     @property
@@ -50,13 +55,17 @@ class FamilyTourDataset(Dataset):
         member_data: np.ndarray,      # (N, max_members, Fm)
         activity_data: np.ndarray,    # (N, max_members, max_activities, Fa)
         member_mask: np.ndarray,      # (N, max_members)
-        activity_mask: np.ndarray     # (N, max_members, max_activities)
+        activity_mask: np.ndarray,     # (N, max_members, max_activities)
+        family_pattern: np.ndarray,     # (N, pattern_dim)
+        member_pattern: np.ndarray      # (N, max_members, pattern_dim)
     ):
         self.family_data = torch.FloatTensor(family_data)
         self.member_data = torch.FloatTensor(member_data)
         self.activity_data = torch.FloatTensor(activity_data)
         self.member_mask = torch.BoolTensor(member_mask)
         self.activity_mask = torch.BoolTensor(activity_mask)
+        self.family_pattern = torch.FloatTensor(family_pattern)
+        self.member_pattern = torch.FloatTensor(member_pattern)
         
     def __len__(self):
         return len(self.family_data)
@@ -67,7 +76,9 @@ class FamilyTourDataset(Dataset):
             'member_attr': self.member_data[idx],
             'activities': self.activity_data[idx],
             'member_mask': self.member_mask[idx],
-            'activity_mask': self.activity_mask[idx]
+            'activity_mask': self.activity_mask[idx],
+            'family_pattern': self.family_pattern[idx],
+            'member_pattern': self.member_pattern[idx]
         }
 
 
@@ -78,7 +89,9 @@ def collate_fn(batch: List[Dict]) -> FamilyTourBatch:
         member_attr=torch.stack([b['member_attr'] for b in batch]),
         member_mask=torch.stack([b['member_mask'] for b in batch]),
         activities=torch.stack([b['activities'] for b in batch]),
-        activity_mask=torch.stack([b['activity_mask'] for b in batch])
+        activity_mask=torch.stack([b['activity_mask'] for b in batch]),
+        family_pattern=torch.stack([b['family_pattern'] for b in batch]),
+        member_pattern=torch.stack([b['member_pattern'] for b in batch])
     )
 
 

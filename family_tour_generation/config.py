@@ -36,6 +36,9 @@ class ModelConfig:
     
     # 损失权重
     loss_weights: dict = None
+
+    # 使用模式专家
+    use_pattern_condition = True
     
     def __post_init__(self):
         if self.loss_weights is None:
@@ -43,8 +46,9 @@ class ModelConfig:
                 'continuous': 1.0,
                 'purpose': 1.0,
                 'mode': 1.0,
-                'driver': 0.5,
-                'joint': 0.5
+                'driver': 1,
+                'joint': 1,
+                'pattern': 0.2
             }
 
 
@@ -61,6 +65,6 @@ class TrainConfig:
     # Focal Loss参数
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
-    
+
     # 设备
     device: str = 'cuda'

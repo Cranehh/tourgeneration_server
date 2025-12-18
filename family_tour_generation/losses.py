@@ -78,13 +78,18 @@ class FamilyTourLoss(nn.Module):
         
         # 损失权重
         self.weights = model_config.loss_weights
+
+        # 新增: 模式预测损失
+        self.pattern_loss = None
+        self.pattern_loss_weights = self.weights.get('pattern', 0.5)
     
     def forward(
         self,
         predictions: Dict[str, torch.Tensor],
         targets: torch.Tensor,
         member_mask: torch.BoolTensor,
-        activity_mask: torch.BoolTensor
+        activity_mask: torch.BoolTensor,
+        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增参数
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
@@ -151,7 +156,24 @@ class FamilyTourLoss(nn.Module):
         
         # 加权总损失
         total_loss = sum(self.weights[k] * v for k, v in losses.items())
-        
+
+        # 新增: 模式预测损失
+        if pattern_outputs is not None:
+            if self.pattern_loss is None:
+                self.pattern_loss = PatternPredictionLoss()
+
+            # 从 pattern_outputs 中获取目标分布
+            family_target = pattern_outputs.get('family_pattern_target')
+            individual_target = pattern_outputs.get('individual_pattern_target')
+
+            if family_target is not None and individual_target is not None:
+                pattern_loss, pattern_losses = self.pattern_loss(
+                    pattern_outputs, family_target, individual_target, member_mask
+                )
+                # losses.update(pattern_losses)
+                losses['pattern'] = pattern_loss
+                total_loss = total_loss + self.pattern_loss_weights * pattern_loss
+
         return total_loss, losses
     
     def compute_member_losses(
@@ -400,3 +422,79 @@ def compute_rollout_loss(
     total_loss = continuous_loss + purpose_loss + mode_loss + 0.5 * driver_loss + 0.5 * joint_loss
 
     return total_loss
+
+
+# ==================== 新增：活动模式预测损失 ====================
+
+class PatternPredictionLoss(nn.Module):
+    """
+    活动模式预测损失
+
+    用 GMM 得到的目标分布监督模式预测专家
+    """
+
+    def __init__(
+            self,
+            family_weight: float = 1.0,
+            individual_weight: float = 1.0
+    ):
+        super().__init__()
+        self.family_weight = family_weight
+        self.individual_weight = individual_weight
+
+    def forward(
+            self,
+            pattern_outputs: Dict[str, torch.Tensor],
+            family_pattern_target: torch.Tensor,
+            individual_pattern_target: torch.Tensor,
+            member_mask: torch.BoolTensor = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Args:
+            pattern_outputs: 模型预测
+                - 'family_pattern_prob': (batch, num_family_patterns)
+                - 'individual_pattern_prob': (batch, max_members, num_individual_patterns)
+            family_pattern_target: (batch, num_family_patterns) GMM 目标分布
+            individual_pattern_target: (batch, max_members, num_individual_patterns) GMM 目标分布
+            member_mask: (batch, max_members) 有效成员掩码
+
+        Returns:
+            total_loss: scalar
+            loss_dict: 各部分损失
+        """
+        losses = {}
+
+        # 家庭模式损失: KL 散度
+        family_pred = pattern_outputs['family_pattern_prob'].clamp(min=1e-8)
+        family_loss = F.kl_div(
+            family_pred.log(),
+            family_pattern_target,
+            reduction='batchmean'
+        )
+        losses['family_pattern'] = family_loss
+
+        # 个人模式损失: KL 散度
+        individual_pred = pattern_outputs['individual_pattern_prob'].clamp(min=1e-8)
+
+        if member_mask is not None:
+            num_valid = member_mask.sum().clamp(min=1)
+            kl = F.kl_div(
+                individual_pred.log(),
+                individual_pattern_target,
+                reduction='none'
+            ).sum(dim=-1)  # (batch, max_members)
+            individual_loss = (kl * member_mask.float()).sum() / num_valid
+        else:
+            individual_loss = F.kl_div(
+                individual_pred.log(),
+                individual_pattern_target,
+                reduction='batchmean'
+            )
+        losses['individual_pattern'] = individual_loss
+
+        # 总损失
+        total_loss = self.family_weight * family_loss + self.individual_weight * individual_loss
+
+        return total_loss, losses
+
+# ==================== 新增结束 ====================

@@ -4,7 +4,10 @@
 """
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, Any
+
+from torch import Tensor
+
 from config import ModelConfig
 from ple_encoder import PLEEncoder
 from mtan_decoder import MTANDecoder
@@ -63,7 +66,7 @@ class FamilyTourGenerator(nn.Module):
                 - 'joint': (B, max_members, max_activities, num_joint)
         """
         # PLE编码
-        member_repr, family_repr = self.encoder(
+        member_repr, family_repr, pattern_probs = self.encoder(
             batch.family_attr,
             batch.member_attr,
             batch.member_mask
@@ -76,7 +79,8 @@ class FamilyTourGenerator(nn.Module):
                 family_repr=family_repr,
                 target_activities=batch.activities,
                 member_mask=batch.member_mask,
-                activity_mask=batch.activity_mask
+                activity_mask=batch.activity_mask,
+                pattern_outputs=pattern_probs
             )
         else:
             # 推理模式: 自回归生成
@@ -86,7 +90,7 @@ class FamilyTourGenerator(nn.Module):
                 member_mask=batch.member_mask
             )
         
-        return predictions
+        return predictions, pattern_probs
     
     def generate(
         self,
@@ -94,7 +98,7 @@ class FamilyTourGenerator(nn.Module):
         member_attr: torch.Tensor,
         member_mask: torch.BoolTensor,
         max_length: int = None
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, Tensor], Any]:
         """
         生成活动链 (推理接口)
         
@@ -108,7 +112,7 @@ class FamilyTourGenerator(nn.Module):
             generated: dict of tensors
         """
         # PLE编码
-        member_repr, family_repr = self.encoder(
+        member_repr, family_repr, pattern_prob = self.encoder(
             family_attr, member_attr, member_mask
         )
         
@@ -117,8 +121,8 @@ class FamilyTourGenerator(nn.Module):
             member_repr=member_repr,
             family_repr=family_repr,
             member_mask=member_mask,
-            max_length=max_length
-        )
+            max_length=max_length,
+            pattern_outputs=pattern_prob), pattern_prob
     
     def get_encoder_output(
         self,
