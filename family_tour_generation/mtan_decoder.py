@@ -308,58 +308,107 @@ class OutputHeads(nn.Module):
     """
     输出头
     分别预测各个活动属性
+    支持接收模式信息作为条件
     """
-    
-    def __init__(self, config: ModelConfig):
+
+    def __init__(self, config: ModelConfig,
+                 num_family_patterns: int = 118,
+                 num_individual_patterns: int = 207):
         super().__init__()
         self.config = config
-        
-        # 连续属性回归头 (开始时间, 结束时间的z-score)
+        self.num_family_patterns = num_family_patterns
+        self.num_individual_patterns = num_individual_patterns
+
+        # 模式信息投影
+        self.family_pattern_proj = nn.Linear(num_family_patterns, config.d_model)
+        self.individual_pattern_proj = nn.Linear(num_individual_patterns, config.d_model)
+
+        ## norm化
+        self.individual_pattern_norm = nn.LayerNorm(config.d_model)
+        self.family_pattern_norm = nn.LayerNorm(config.d_model)
+
+        # 输入维度：d_model
+        input_dim = config.d_model
+
+        # 连续属性回归头
         self.continuous_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Linear(input_dim, config.d_model // 2),
             nn.ReLU(),
             nn.Linear(config.d_model // 2, config.continuous_dim)
         )
-        
+
         # 离散属性分类头
         self.purpose_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Linear(input_dim, config.d_model // 2),
             nn.ReLU(),
             nn.Linear(config.d_model // 2, config.num_purposes)
         )
-        
+
         self.mode_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Linear(input_dim, config.d_model // 2),
             nn.ReLU(),
             nn.Linear(config.d_model // 2, config.num_modes)
         )
-        
+
         self.driver_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Linear(input_dim, config.d_model // 2),
             nn.ReLU(),
             nn.Linear(config.d_model // 2, config.num_driver_status)
         )
-        
+
         self.joint_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Linear(input_dim, config.d_model // 2),
             nn.ReLU(),
             nn.Linear(config.d_model // 2, config.num_joint_status)
         )
-    
-    def forward(self, hidden: torch.Tensor) -> Dict[str, torch.Tensor]:
+
+    def forward(
+            self,
+            hidden: torch.Tensor,
+            family_pattern_prob: torch.Tensor = None,
+            individual_pattern_prob: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            hidden: (*, d_model)
-        
+            hidden: (*, d_model) decoder 输出
+            individual_pattern_prob: (batch, max_members, num_patterns) 个人模式概率
+
         Returns:
             dict of predictions
         """
+        family_pattern_emb = self.family_pattern_proj(family_pattern_prob)  # (B, d_model)
+        if hidden.dim() == 4:
+            family_pattern_emb = family_pattern_emb.unsqueeze(1).unsqueeze(2).expand(-1, hidden.size(1), hidden.size(2),
+                                                                                     -1)
+        elif hidden.dim() == 3:
+            family_pattern_emb = family_pattern_emb.unsqueeze(1).expand(-1, hidden.size(1), -1)
+        hidden = family_pattern_emb + hidden  # (*, d_model)
+        hidden = self.family_pattern_norm(hidden)
+
+        # 如果有模式信息，拼接到 hidden
+        # 投影模式信息
+        individual_pattern_emb = self.individual_pattern_proj(individual_pattern_prob)  # (B, M, d_model//4)
+
+        # 扩展到与 hidden 相同的维度
+        if hidden.dim() == 4:
+            # hidden: (B, M, T, d_model)
+            individual_pattern_emb = individual_pattern_emb.unsqueeze(2).expand(-1, -1, hidden.size(2), -1)
+        elif hidden.dim() == 3 and individual_pattern_emb.dim() == 3:
+            # hidden: (B, M, d_model), pattern_emb: (B, M, d_model//4)
+            pass  # 维度已匹配
+
+        # 拼接
+        hidden = individual_pattern_emb + hidden  # (*, d_model + d_model//4)
+        hidden = self.individual_pattern_norm(hidden)
+
+
+
         return {
-            'continuous': self.continuous_head(hidden),      # (*, 2)
-            'purpose': self.purpose_head(hidden),            # (*, 10)
-            'mode': self.mode_head(hidden),                  # (*, 11)
-            'driver': self.driver_head(hidden),              # (*, 2)
-            'joint': self.joint_head(hidden)                 # (*, 2)
+            'continuous': self.continuous_head(hidden),
+            'purpose': self.purpose_head(hidden),
+            'mode': self.mode_head(hidden),
+            'driver': self.driver_head(hidden),
+            'joint': self.joint_head(hidden)
         }
 
 
@@ -584,7 +633,10 @@ class MTANDecoder(nn.Module):
             )
         
         # 输出预测
-        predictions = self.output_heads(decoded)
+        predictions = self.output_heads(decoded,
+                                        pattern_outputs['family_pattern_prob'],
+                                        pattern_outputs['individual_pattern_prob']
+                                        )
         
         # 应用时间约束
         predictions['continuous'] = self._apply_time_constraints(
@@ -727,7 +779,10 @@ class MTANDecoder(nn.Module):
             last_hidden = last_hidden.view(batch_size, max_members, -1)
             
             # 预测
-            step_pred = self.output_heads(last_hidden)
+            step_pred = self.output_heads(last_hidden,
+                                        pattern_outputs['family_pattern_prob'],
+                                        pattern_outputs['individual_pattern_prob']
+                                        )
             
             # 应用时间约束
             is_first = (t == 0)
@@ -785,7 +840,8 @@ def autoregressive_rollout(
         target_activities: torch.Tensor,
         member_mask: torch.BoolTensor,
         start_pos: int,
-        rollout_length: int = 3
+        rollout_length: int = 3,
+        pattern_probs: Dict[str, torch.Tensor] = None
 ) -> Dict[str, torch.Tensor]:
     """
     从 start_pos 开始做 rollout_length 步自回归
@@ -856,9 +912,21 @@ def autoregressive_rollout(
         decoded = decoder.transformer_decoder(
             tgt=decoder_input_flat, memory=memory_flat, tgt_mask=causal_mask
         )
-
+        decoded = decoded.view(batch_size, max_members, decoded.shape[1], -1)
+        # 新增: 对 decoder 输出进行模式调制
+        if decoder.use_pattern_condition and pattern_probs is not None:
+            decoded = decoder.pattern_condition(
+                decoded,
+                pattern_probs['family_pattern_prob'],
+                pattern_probs['individual_pattern_prob']
+            )
+        decoded = decoded.view(batch_size * max_members, decoded.shape[2], -1)
         last_hidden = decoded[:, -1, :].view(batch_size, max_members, -1)
-        step_pred = decoder.output_heads(last_hidden)
+
+        step_pred = decoder.output_heads(last_hidden,
+                                        pattern_probs['family_pattern_prob'],
+                                        pattern_probs['individual_pattern_prob']
+                                        )
 
         # 时间约束
         is_first = (start_pos + t == 0)

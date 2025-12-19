@@ -377,7 +377,10 @@ class ScheduledSamplingDecoder(nn.Module):
             last_hidden = decoded[:, -1, :].view(batch_size, max_members, -1)
             
             # 预测
-            step_pred = self.decoder.output_heads(last_hidden)
+            step_pred = self.decoder.output_heads(last_hidden,
+                                                  pattern_outputs['family_pattern_prob'],
+                                                  pattern_outputs['individual_pattern_prob']
+                                                  )
             
             # 时间约束
             is_first = (t == 0)
@@ -601,7 +604,8 @@ class ExposureBiasTrainer:
             rollout_preds = autoregressive_rollout(
                 self.model.decoder, member_repr, family_repr,
                 batch.activities, batch.member_mask,
-                start_pos=start_pos, rollout_length=rollout_length
+                start_pos=start_pos, rollout_length=rollout_length,
+                pattern_probs=pattern_prob
             )
             ar_loss = compute_rollout_loss(
                 rollout_preds, batch.activities,

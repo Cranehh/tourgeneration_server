@@ -23,7 +23,7 @@ from mtan_decoder import autoregressive_rollout
 from losses import compute_rollout_loss
 import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 sys.path.append('family_tour_generation')
 
@@ -268,7 +268,6 @@ class ScheduledSamplingTrainer:
 
         for epoch in range(self.train_config.num_epochs):
             self.current_epoch = epoch
-
             # 训练
             train_metrics = self.train_epoch()
             tf_prob = self.eb_trainer.get_current_tf_prob()
@@ -279,7 +278,7 @@ class ScheduledSamplingTrainer:
             )
 
             # 验证
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 1 == 0:
                 val_metrics = self.validate()
                 if val_metrics:
                     logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['val_total']:.4f} - TF Val Loss: {val_metrics['val_total_tf']:.4f}")
