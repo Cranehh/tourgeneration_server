@@ -426,21 +426,30 @@ def compute_rollout_loss(
 
 # ==================== 新增：活动模式预测损失 ====================
 
+# ==================== 新增：活动模式预测损失 ====================
+
 class PatternPredictionLoss(nn.Module):
     """
     活动模式预测损失
 
-    用 GMM 得到的目标分布监督模式预测专家
+    使用软交叉熵 + Label Smoothing，比 KL 散度更稳定
     """
 
     def __init__(
             self,
             family_weight: float = 1.0,
-            individual_weight: float = 1.0
+            individual_weight: float = 1.0,
+            label_smoothing: float = 0.1
     ):
         super().__init__()
         self.family_weight = family_weight
         self.individual_weight = individual_weight
+        self.label_smoothing = label_smoothing
+
+    def _smooth_target(self, target: torch.Tensor) -> torch.Tensor:
+        """对目标分布做 Label Smoothing"""
+        n_classes = target.size(-1)
+        return (1 - self.label_smoothing) * target + self.label_smoothing / n_classes
 
     def forward(
             self,
@@ -454,8 +463,9 @@ class PatternPredictionLoss(nn.Module):
             pattern_outputs: 模型预测
                 - 'family_pattern_prob': (batch, num_family_patterns)
                 - 'individual_pattern_prob': (batch, max_members, num_individual_patterns)
+                - 或带 _logits 版本
             family_pattern_target: (batch, num_family_patterns) GMM 目标分布
-            individual_pattern_target: (batch, max_members, num_individual_patterns) GMM 目标分布
+            individual_pattern_target: (batch, max_members, num_individual_patterns)
             member_mask: (batch, max_members) 有效成员掩码
 
         Returns:
@@ -464,37 +474,40 @@ class PatternPredictionLoss(nn.Module):
         """
         losses = {}
 
-        # 家庭模式损失: KL 散度
-        family_pred = pattern_outputs['family_pattern_prob'].clamp(min=1e-8)
-        family_loss = F.kl_div(
-            family_pred.log(),
-            family_pattern_target,
-            reduction='batchmean'
-        )
+        # ========== 家庭模式损失: 软交叉熵 ==========
+        if 'family_pattern_logits' in pattern_outputs:
+            family_log_pred = F.log_softmax(pattern_outputs['family_pattern_logits'], dim=-1)
+        else:
+            # 从 prob 转换，先 clamp 防止 log(0)
+            family_prob = pattern_outputs['family_pattern_prob'].clamp(min=1e-8)
+            family_log_pred = F.log_softmax(family_prob.log(), dim=-1)
+
+        smoothed_family = self._smooth_target(family_pattern_target)
+        family_loss = -(smoothed_family * family_log_pred).sum(dim=-1).mean()
         losses['family_pattern'] = family_loss
 
-        # 个人模式损失: KL 散度
-        individual_pred = pattern_outputs['individual_pattern_prob'].clamp(min=1e-8)
+        # ========== 个人模式损失: 软交叉熵 ==========
+        if 'individual_pattern_logits' in pattern_outputs:
+            individual_log_pred = F.log_softmax(pattern_outputs['individual_pattern_logits'], dim=-1)
+        else:
+            individual_prob = pattern_outputs['individual_pattern_prob'].clamp(min=1e-8)
+            individual_log_pred = F.log_softmax(individual_prob.log(), dim=-1)
+
+        smoothed_individual = self._smooth_target(individual_pattern_target)
+        ce = -(smoothed_individual * individual_log_pred).sum(dim=-1)  # (batch, max_members)
 
         if member_mask is not None:
             num_valid = member_mask.sum().clamp(min=1)
-            kl = F.kl_div(
-                individual_pred.log(),
-                individual_pattern_target,
-                reduction='none'
-            ).sum(dim=-1)  # (batch, max_members)
-            individual_loss = (kl * member_mask.float()).sum() / num_valid
+            individual_loss = (ce * member_mask.float()).sum() / num_valid
         else:
-            individual_loss = F.kl_div(
-                individual_pred.log(),
-                individual_pattern_target,
-                reduction='batchmean'
-            )
+            individual_loss = ce.mean()
         losses['individual_pattern'] = individual_loss
 
         # 总损失
         total_loss = self.family_weight * family_loss + self.individual_weight * individual_loss
 
         return total_loss, losses
+
+# ==================== 新增结束 ====================
 
 # ==================== 新增结束 ====================

@@ -580,8 +580,8 @@ class ExposureBiasTrainer:
         )
 
         ar_stage = {1:{'prob': 0.3, 'length':2, 'ar_ratio':0.3},
-                    2:{'prob': 0.5, 'length':3, 'ar_ratio':0.5},
-                    3:{'prob': 0.8, 'length':5, 'ar_ratio':1.0}}
+                    2:{'prob': 0.5, 'length':3, 'ar_ratio':0.4},
+                    3:{'prob': 0.8, 'length':3, 'ar_ratio':0.5}}
         if current_epoch < 10:
             stage = 1
         elif current_epoch < 50:
