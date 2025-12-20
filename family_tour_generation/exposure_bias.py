@@ -355,12 +355,21 @@ class ScheduledSamplingDecoder(nn.Module):
             causal_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device), diagonal=1
             ).bool()
-            
-            decoded = self.decoder.transformer_decoder(
-                tgt=decoder_input_flat,
-                memory=memory_flat,
-                tgt_mask=causal_mask
-            )
+
+            if self.decoder.use_pattern_conditioned_decoder and pattern_outputs is not None:
+                decoded = self.decoder.transformer_decoder(
+                    tgt=decoder_input_flat,
+                    memory=memory_flat,
+                    family_pattern_prob=pattern_outputs.get('family_pattern_prob'),
+                    individual_pattern_prob=pattern_outputs.get('individual_pattern_prob'),
+                    tgt_mask=causal_mask
+                )
+            else:
+                decoded = self.decoder.transformer_decoder(
+                    tgt=decoder_input_flat,
+                    memory=memory_flat,
+                    tgt_mask=causal_mask
+                )
 
             # 新增: 对 decoder 输出进行模式调制
             if self.decoder.use_pattern_condition and pattern_outputs is not None:

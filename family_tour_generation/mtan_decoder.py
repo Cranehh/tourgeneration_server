@@ -198,6 +198,186 @@ class PatternConditionModule(nn.Module):
         return hidden
 
 
+class PatternConditionedDecoderLayer(nn.Module):
+    """
+    带模式条件调制的 Decoder Layer
+
+    结构: Self-Attention → Cross-Attention → Pattern Condition → FFN
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            d_ff: int,
+            num_family_patterns: int = 118,
+            num_individual_patterns: int = 207,
+            dropout: float = 0.1
+    ):
+        super().__init__()
+
+        # Self-Attention
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+
+        # Cross-Attention (with memory)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Pattern Condition (adaLN 调制)
+        self.pattern_proj_family = nn.Linear(num_family_patterns, d_model)
+        self.pattern_proj_individual = nn.Linear(num_individual_patterns, d_model)
+        self.adaLN = AdaLNModulation(d_model, d_model * 2)
+        self.pattern_fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.SiLU()
+        )
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(
+            self,
+            tgt: torch.Tensor,
+            memory: torch.Tensor,
+            family_pattern_prob: torch.Tensor = None,
+            individual_pattern_prob: torch.Tensor = None,
+            tgt_mask: torch.Tensor = None,
+            tgt_key_padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            tgt: (batch * max_members, seq_len, d_model)
+            memory: (batch * max_members, seq_len, d_model)
+            family_pattern_prob: (batch, num_family_patterns)
+            individual_pattern_prob: (batch, max_members, num_individual_patterns)
+            tgt_mask: causal mask
+            tgt_key_padding_mask: padding mask
+
+        Returns:
+            (batch * max_members, seq_len, d_model)
+        """
+        # 1. Self-Attention
+        attn_out, _ = self.self_attn(tgt, tgt, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
+        tgt = self.norm1(tgt + self.dropout1(attn_out))
+
+        # 2. Cross-Attention
+        attn_out, _ = self.cross_attn(tgt, memory, memory)
+        tgt = self.norm2(tgt + self.dropout2(attn_out))
+
+        # 3. Pattern Condition (adaLN)
+        if family_pattern_prob is not None and individual_pattern_prob is not None:
+            tgt = self._apply_pattern_condition(tgt, family_pattern_prob, individual_pattern_prob)
+
+        # 4. FFN
+        ffn_out = self.ffn(tgt)
+        tgt = self.norm3(tgt + ffn_out)
+
+        return tgt
+
+    def _apply_pattern_condition(
+            self,
+            hidden: torch.Tensor,
+            family_pattern_prob: torch.Tensor,
+            individual_pattern_prob: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        应用模式条件调制
+
+        Args:
+            hidden: (batch * max_members, seq_len, d_model)
+            family_pattern_prob: (batch, num_family_patterns)
+            individual_pattern_prob: (batch, max_members, num_individual_patterns)
+        """
+        batch_size = family_pattern_prob.size(0)
+        max_members = individual_pattern_prob.size(1)
+        seq_len = hidden.size(1)
+
+        # 投影模式信息
+        family_emb = self.pattern_proj_family(family_pattern_prob)  # (batch, d_model)
+        individual_emb = self.pattern_proj_individual(individual_pattern_prob)  # (batch, max_members, d_model)
+
+        # 扩展 family_emb
+        family_emb = family_emb.unsqueeze(1).expand(-1, max_members, -1)  # (batch, max_members, d_model)
+
+        # 展平
+        family_emb_flat = family_emb.reshape(batch_size * max_members, -1)  # (batch * max_members, d_model)
+        individual_emb_flat = individual_emb.reshape(batch_size * max_members, -1)  # (batch * max_members, d_model)
+
+        # 融合条件
+        combined = torch.cat([family_emb_flat, individual_emb_flat], dim=-1)
+        combined = self.pattern_fusion(combined)  # (batch * max_members, d_model * 2)
+
+        # adaLN 调制
+        hidden = self.adaLN(hidden, combined)
+
+        return hidden
+
+
+class PatternConditionedDecoder(nn.Module):
+    """
+    带模式条件的 Decoder
+    每层都注入模式信息
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            d_ff: int,
+            num_layers: int,
+            num_family_patterns: int = 118,
+            num_individual_patterns: int = 207,
+            dropout: float = 0.1
+    ):
+        super().__init__()
+
+        self.layers = nn.ModuleList([
+            PatternConditionedDecoderLayer(
+                d_model, num_heads, d_ff,
+                num_family_patterns, num_individual_patterns, dropout
+            )
+            for _ in range(num_layers)
+        ])
+        self.num_layers = num_layers
+
+    def forward(
+            self,
+            tgt: torch.Tensor,
+            memory: torch.Tensor,
+            family_pattern_prob: torch.Tensor = None,
+            individual_pattern_prob: torch.Tensor = None,
+            tgt_mask: torch.Tensor = None,
+            tgt_key_padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            tgt: (batch * max_members, seq_len, d_model)
+            memory: (batch * max_members, seq_len, d_model)
+            family_pattern_prob: (batch, num_family_patterns)
+            individual_pattern_prob: (batch, max_members, num_individual_patterns)
+        """
+        output = tgt
+
+        for layer in self.layers:
+            output = layer(
+                output, memory,
+                family_pattern_prob, individual_pattern_prob,
+                tgt_mask, tgt_key_padding_mask
+            )
+
+        return output
+
+
 class CrossRoleAttention(nn.Module):
     """
     跨成员注意力层
@@ -488,19 +668,32 @@ class MTANDecoder(nn.Module):
         
         # Cross-Role注意力
         self.cross_role_attention = CrossRoleAttention(config)
-        
-        # Transformer Decoder层
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.d_model,
-            nhead=config.num_heads,
-            dim_feedforward=config.d_ff,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, 
-            num_layers=config.num_decoder_layers
-        )
+
+        # Transformer Decoder层（带模式条件）
+        self.use_pattern_conditioned_decoder = getattr(config, 'use_pattern_condition', True)
+
+        if self.use_pattern_conditioned_decoder:
+            self.transformer_decoder = PatternConditionedDecoder(
+                d_model=config.d_model,
+                num_heads=config.num_heads,
+                d_ff=config.d_ff,
+                num_layers=config.num_decoder_layers,
+                num_family_patterns=getattr(config, 'num_family_patterns', 118),
+                num_individual_patterns=getattr(config, 'num_individual_patterns', 207),
+                dropout=config.dropout
+            )
+        else:
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=config.d_model,
+                nhead=config.num_heads,
+                dim_feedforward=config.d_ff,
+                dropout=config.dropout,
+                batch_first=True
+            )
+            self.transformer_decoder = nn.TransformerDecoder(
+                decoder_layer,
+                num_layers=config.num_decoder_layers
+            )
         
         # 输出头
         self.output_heads = OutputHeads(config)
@@ -614,12 +807,24 @@ class MTANDecoder(nn.Module):
         causal_mask = causal_mask.clone()
         causal_mask.fill_diagonal_(False)
         # Decoder
-        decoded = self.transformer_decoder(
-            tgt=decoder_input_flat,
-            memory=memory_flat,
-            tgt_mask=causal_mask,
-            # tgt_key_padding_mask=tgt_key_padding_mask
-        )  # (batch * max_members, max_activities, d_model)
+        # Decoder
+        if self.use_pattern_conditioned_decoder and pattern_outputs is not None:
+            decoded = self.transformer_decoder(
+                tgt=decoder_input_flat,
+                memory=memory_flat,
+                family_pattern_prob=pattern_outputs.get('family_pattern_prob'),
+                individual_pattern_prob=pattern_outputs.get('individual_pattern_prob'),
+                tgt_mask=causal_mask,
+                tgt_key_padding_mask=None
+            )
+        else:
+            decoded = self.transformer_decoder(
+                tgt=decoder_input_flat,
+                memory=memory_flat,
+                tgt_mask=causal_mask,
+                tgt_key_padding_mask=None
+            )
+
         nan_decoded = torch.isnan(decoded).sum()
         # 恢复形状
         decoded = decoded.view(batch_size, max_members, max_activities, -1)
@@ -758,11 +963,20 @@ class MTANDecoder(nn.Module):
             ).bool()
             
             # Decode
-            decoded = self.transformer_decoder(
-                tgt=decoder_input_flat,
-                memory=memory_flat,
-                tgt_mask=causal_mask
-            )
+            if self.use_pattern_conditioned_decoder and pattern_outputs is not None:
+                decoded = self.transformer_decoder(
+                    tgt=decoder_input_flat,
+                    memory=memory_flat,
+                    family_pattern_prob=pattern_outputs.get('family_pattern_prob'),
+                    individual_pattern_prob=pattern_outputs.get('individual_pattern_prob'),
+                    tgt_mask=causal_mask
+                )
+            else:
+                decoded = self.transformer_decoder(
+                    tgt=decoder_input_flat,
+                    memory=memory_flat,
+                    tgt_mask=causal_mask
+                )
             # 恢复形状
             decoded = decoded.view(batch_size, max_members, decoded.shape[1], -1)
 
@@ -909,9 +1123,20 @@ def autoregressive_rollout(
         memory_flat = memory.view(batch_size * max_members, seq_len, -1)
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
 
-        decoded = decoder.transformer_decoder(
-            tgt=decoder_input_flat, memory=memory_flat, tgt_mask=causal_mask
-        )
+        if decoder.use_pattern_conditioned_decoder and pattern_probs is not None:
+            decoded = decoder.transformer_decoder(
+                tgt=decoder_input_flat,
+                memory=memory_flat,
+                family_pattern_prob=pattern_probs.get('family_pattern_prob'),
+                individual_pattern_prob=pattern_probs.get('individual_pattern_prob'),
+                tgt_mask=causal_mask
+            )
+        else:
+            decoded = decoder.transformer_decoder(
+                tgt=decoder_input_flat,
+                memory=memory_flat,
+                tgt_mask=causal_mask
+            )
         decoded = decoded.view(batch_size, max_members, decoded.shape[1], -1)
         # 新增: 对 decoder 输出进行模式调制
         if decoder.use_pattern_condition and pattern_probs is not None:

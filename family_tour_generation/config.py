@@ -11,6 +11,8 @@ class ModelConfig:
     family_dim: int = 32          # 家庭特征维度 Ff
     member_dim: int = 48          # 成员特征维度 Fm
     activity_dim: int = 27        # 活动特征维度 Fa (2连续 + 10 + 11 + 2 + 2 one-hot)
+    num_family_patterns: int = 118  # 家庭出行模式类别数
+    num_individual_patterns: int = 207  # 个人出行模式类别数
     
     # 活动属性配置
     continuous_dim: int = 2       # 连续属性维度 (开始时间z-score, 结束时间z-score)
