@@ -482,7 +482,7 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
                 onehot_vector = person_encoded[f'person_{col}'][member.name]
                 member_feature.extend(onehot_vector.tolist())
             member_feature.append(1) # 标记为有效成员
-            member_feature.append(person_encoded['person_work_position'][member.name].tolist()) # 工作地点one-hot编码
+            member_feature.extend(person_encoded['person_work_position'][member.name].tolist()) # 工作地点one-hot编码
             member_features.extend(member_feature)
             member_info = family_members[family_members.index == member.name][['家庭编号','成员编号']].values[0]
             member_activity = activity_df[(activity_df['家庭编号'] == member_info[0]) & (activity_df['家庭成员编号'] == member_info[1])].sort_values('出行序号')
