@@ -301,7 +301,9 @@ class ScheduledSamplingDecoder(nn.Module):
         member_mask: torch.BoolTensor,
         activity_mask: torch.BoolTensor,
         tf_prob: float,
-        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增
+        pattern_outputs: Dict[str, torch.Tensor] = None,  # 新增
+        home_zones: torch.Tensor = None,  # 新增: [B]
+        target_destinations: torch.Tensor = None  # 新增: [B, M, T] 用于计算origin
     ) -> Dict[str, torch.Tensor]:
         """
         Scheduled Sampling 前向传播
@@ -386,6 +388,20 @@ class ScheduledSamplingDecoder(nn.Module):
             last_hidden = decoded[:, -1, :].view(batch_size, max_members, -1)
             
             # 预测
+            # 当前活动的origin就是上一个活动的destination
+            current_origin = prev_destination  # [B, M]
+
+            # 预测
+            step_pred = self.decoder.output_heads(last_hidden,
+                                             pattern_outputs['family_pattern_prob'],
+                                             pattern_outputs['individual_pattern_prob'],
+                                             origin_zones=current_origin
+                                             )
+
+            # 获取预测的destination
+            if 'destination' in step_pred:
+                pred_destination = step_pred['destination'].argmax(dim=-1)  # [B, M]
+                prev_destination = pred_destination  # 更新为下一步的origin
             step_pred = self.decoder.output_heads(last_hidden,
                                                   pattern_outputs['family_pattern_prob'],
                                                   pattern_outputs['individual_pattern_prob']
@@ -614,7 +630,9 @@ class ExposureBiasTrainer:
                 self.model.decoder, member_repr, family_repr,
                 batch.activities, batch.member_mask,
                 start_pos=start_pos, rollout_length=rollout_length,
-                pattern_probs=pattern_prob
+                pattern_probs=pattern_prob,
+                home_zones=batch.home_zones,  # ← 新增
+                target_destinations=batch.target_destinations  # ← 新增
             )
             ar_loss = compute_rollout_loss(
                 rollout_preds, batch.activities,

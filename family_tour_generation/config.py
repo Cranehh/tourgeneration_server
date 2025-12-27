@@ -41,6 +41,17 @@ class ModelConfig:
 
     # 使用模式专家
     use_pattern_condition = True
+
+    # ===== 新增：目的地预测配置 =====
+    use_destination_prediction: bool = True
+    num_zones: int = 2006  # TAZ数量
+    zone_embed_dim: int = 64  # zone嵌入维度
+    n_lda_topics: int = 12  # LDA主题数
+    n_affordance_purposes: int = 5  # affordance维度（与num_purposes一致）
+
+    # 特殊zone ID
+    zone_none: int = 2006  # 无效zone
+    zone_padding: int = 2007  # padding
     
     def __post_init__(self):
         if self.loss_weights is None:
@@ -50,7 +61,8 @@ class ModelConfig:
                 'mode': 1.0,
                 'driver': 1,
                 'joint': 1,
-                'pattern': 0.2
+                'pattern': 0.2,
+                'destination': 1.0  # 新增
             }
 
 

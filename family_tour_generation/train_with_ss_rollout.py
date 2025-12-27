@@ -357,13 +357,27 @@ def main():
 
     # 创建模型
     model = create_model(model_config)
+    # ===== 新增：加载zone外部特征 =====
+    if model_config.use_destination_prediction:
+        data_dir = "../数据"
+
+        # 加载预计算的特征
+        lda_matrix = np.load(f'{data_dir}/zone_lda.npy')  # [2006, n_topics]
+        affordance_matrix = np.load(f'{data_dir}/zone_affordance.npy')  # [2006, n_purposes]
+        impedance_matrix = np.load(f'{data_dir}/zone_impedance.npy')  # [2006, 2006]
+
+        model.decoder.zone_module.load_external_features(
+            lda_matrix, affordance_matrix, impedance_matrix
+        )
+        print("Zone external features loaded.")
 
     # 创建示例数据 (实际使用时替换为真实数据)
     # family_data, member_data, activity_data, member_mask, activity_mask = create_dummy_data(
     #     model_config, num_samples=1000
     # )
     data_dir = "../数据"
-    family_data_train = np.load(f'{data_dir}/family_sample_improved_cluster_train.npy')[:, :10]
+    data = np.load(f'{data_dir}/family_sample_improved_cluster_train.npy')
+    family_data_train = np.concatenate([data[:, :10], data[:, -1:]], axis=1)
     member_data_train = np.load(f'{data_dir}/family_member_sample_improved_cluster_train.npy')
     activity_data_train = np.load(f'{data_dir}/family_activity_train.npy')
     member_mask_train = member_data_train[:, :, -1]

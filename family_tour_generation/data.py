@@ -24,6 +24,9 @@ class FamilyTourBatch:
 
     family_pattern: torch.Tensor        # (B, pattern_dim) 家庭活动模式
     member_pattern: torch.Tensor        # (B, max_members, pattern_dim) 成员
+    # ===== 新增：Zone信息 =====
+    home_zones: torch.LongTensor = None  # (B,) 家的zone ID
+    target_destinations: torch.LongTensor = None  # (B, M, T) 目标目的地
     
     def to(self, device):
         """移动到指定设备"""
@@ -34,7 +37,9 @@ class FamilyTourBatch:
             activities=self.activities.to(device),
             activity_mask=self.activity_mask.to(device),
             family_pattern = self.family_pattern.to(device),
-            member_pattern = self.member_pattern.to(device)
+            member_pattern = self.member_pattern.to(device),
+            home_zones=self.home_zones.to(device) if self.home_zones is not None else None,
+            target_destinations=self.target_destinations.to(device) if self.target_destinations is not None else None,
         )
     
     @property
@@ -71,6 +76,13 @@ class FamilyTourDataset(Dataset):
         return len(self.family_data)
     
     def __getitem__(self, idx):
+        # ===== 新增：提取zone信息 =====
+        # 假设family_data的最后一维是home_zone
+        home_zone = int(self.family_data[idx, -1].item())
+
+        # 假设activity_data的最后一维是destination_zone (倒数第一位)
+        # activity_data: [M, T, Fa], 其中Fa的最后一维是end_position
+        target_destinations = self.activity_data[idx, :, :, -1].long()  # [M, T]
         return {
             'family_attr': self.family_data[idx],
             'member_attr': self.member_data[idx],
@@ -78,7 +90,9 @@ class FamilyTourDataset(Dataset):
             'member_mask': self.member_mask[idx],
             'activity_mask': self.activity_mask[idx],
             'family_pattern': self.family_pattern[idx],
-            'member_pattern': self.member_pattern[idx]
+            'member_pattern': self.member_pattern[idx],
+            'home_zone': torch.tensor(home_zone, dtype=torch.long),           # 新增
+            'target_destinations': target_destinations
         }
 
 
@@ -91,7 +105,9 @@ def collate_fn(batch: List[Dict]) -> FamilyTourBatch:
         activities=torch.stack([b['activities'] for b in batch]),
         activity_mask=torch.stack([b['activity_mask'] for b in batch]),
         family_pattern=torch.stack([b['family_pattern'] for b in batch]),
-        member_pattern=torch.stack([b['member_pattern'] for b in batch])
+        member_pattern=torch.stack([b['member_pattern'] for b in batch]),
+        home_zones=torch.stack([b['home_zone'] for b in batch]),  # 新增
+        target_destinations=torch.stack([b['target_destinations'] for b in batch]),
     )
 
 

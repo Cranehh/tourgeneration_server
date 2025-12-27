@@ -52,6 +52,33 @@ class FocalLoss(nn.Module):
             return loss
 
 
+def destination_loss(
+        pred_logits: torch.Tensor,
+        target_zones: torch.Tensor,
+        member_mask: torch.BoolTensor,
+        activity_mask: torch.BoolTensor,
+        num_zones: int = 2006,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0
+) -> torch.Tensor:
+    valid_mask = member_mask.unsqueeze(-1) & activity_mask
+    dest_valid_mask = (target_zones < num_zones) & valid_mask
+
+    if dest_valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
+
+    pred_flat = pred_logits.view(-1, pred_logits.size(-1))
+    target_flat = target_zones.view(-1)
+    mask_flat = dest_valid_mask.view(-1)
+
+    pred_valid = pred_flat[mask_flat]
+    target_valid = target_flat[mask_flat]
+
+    ce = F.cross_entropy(pred_valid, target_valid, reduction='none')
+    pt = torch.exp(-ce)
+    focal = focal_alpha * (1 - pt) ** focal_gamma * ce
+
+    return focal.mean()
 class FamilyTourLoss(nn.Module):
     """
     家庭活动链生成的损失函数
@@ -173,6 +200,23 @@ class FamilyTourLoss(nn.Module):
                 # losses.update(pattern_losses)
                 losses['pattern'] = pattern_loss
                 total_loss = total_loss + self.pattern_loss_weights * pattern_loss
+
+        # ===== 新增：目的地损失 =====
+        if 'destination' in predictions:
+            # 从targets提取目标目的地（最后一维）
+            target_destinations = targets[..., -1].long()
+
+            dest_loss = destination_loss(
+                predictions['destination'],
+                target_destinations,
+                member_mask,
+                activity_mask,
+                num_zones=getattr(self.config, 'num_zones', 2006),
+                focal_alpha=self.focal_alpha,
+                focal_gamma=self.focal_gamma
+            )
+            losses['destination'] = dest_loss
+            total_loss = total_loss + self.config.loss_weights.get('destination', 1.0) * dest_loss
 
         return total_loss, losses
     
@@ -420,6 +464,21 @@ def compute_rollout_loss(
 
     # 加权求和
     total_loss = continuous_loss + purpose_loss + mode_loss + 0.5 * driver_loss + 0.5 * joint_loss
+
+
+    # ===== 新增：目的地损失 =====
+    if 'destination' in predictions:
+        target_dest = targets[:, :, start_pos:end_pos, -1].long()
+        pred_dest = predictions['destination'][:, :, :actual_length]
+
+        dest_valid = (target_dest < 2006) & valid_mask
+        if dest_valid.sum() > 0:
+            dest_loss = F.cross_entropy(
+                pred_dest[dest_valid].view(-1, pred_dest.size(-1)),
+                target_dest[dest_valid].view(-1),
+                reduction='mean'
+            )
+            total_loss = total_loss + dest_loss
 
     return total_loss
 

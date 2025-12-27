@@ -43,8 +43,6 @@ class FamilyTourGenerator(nn.Module):
         self.encoder = PLEEncoder(config)
         
         # MTAN Decoder
-        self.decoder = MTANDecoder(config)
-    
     def forward(
         self,
         batch: FamilyTourBatch,
@@ -52,7 +50,7 @@ class FamilyTourGenerator(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
-        
+
         Args:
             batch: FamilyTourBatch数据
             teacher_forcing: 是否使用teacher forcing (训练时True, 推理时False)
@@ -80,14 +78,17 @@ class FamilyTourGenerator(nn.Module):
                 target_activities=batch.activities,
                 member_mask=batch.member_mask,
                 activity_mask=batch.activity_mask,
-                pattern_outputs=pattern_probs
+                pattern_outputs=pattern_probs,
+                home_zones = batch.home_zones,  # 新增
+                target_destinations = batch.target_destinations  # 新增
             )
         else:
             # 推理模式: 自回归生成
             predictions = self.decoder.generate(
                 member_repr=member_repr,
                 family_repr=family_repr,
-                member_mask=batch.member_mask
+                member_mask=batch.member_mask,
+                home_zones=batch.home_zones  # 新增
             )
         
         return predictions, pattern_probs
@@ -97,7 +98,8 @@ class FamilyTourGenerator(nn.Module):
         family_attr: torch.Tensor,
         member_attr: torch.Tensor,
         member_mask: torch.BoolTensor,
-        max_length: int = None
+        max_length: int = None,
+        home_zones=None
     ) -> Tuple[Dict[str, Tensor], Any]:
         """
         生成活动链 (推理接口)
@@ -122,7 +124,8 @@ class FamilyTourGenerator(nn.Module):
             family_repr=family_repr,
             member_mask=member_mask,
             max_length=max_length,
-            pattern_outputs=pattern_prob), pattern_prob
+            pattern_outputs=pattern_prob,
+            home_zones=batch.home_zones), pattern_prob
     
     def get_encoder_output(
         self,
