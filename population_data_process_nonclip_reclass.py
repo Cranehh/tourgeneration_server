@@ -125,7 +125,8 @@ class PopulationDataEncoder:
             tmp = cluster_profile[cluster_profile['cluster']==i]
             profile = tmp.values[0][1:]
             encoded_data['cluster_profile'].append(profile)
-        encoded_data['family_position'] = self.onehot_encoders[f'position'].transform(family_df[['new_zoneID']].astype(int))
+        # encoded_data['family_position'] = self.onehot_encoders[f'position'].transform(family_df[['new_zoneID']].astype(int))
+        encoded_data['family_position'] = family_df[['new_zoneID']].astype(int).values.reshape(-1)
             
         return encoded_data
     
@@ -143,10 +144,12 @@ class PopulationDataEncoder:
             # encoded是二维数组，每行是一个样本的one-hot向量
             encoded_data[f'person_{col}'] = encoded
 
-        judge = person_df['new_zoneID'].isna().values
-        re = self.onehot_encoders[f'position'].transform(person_df[['new_zoneID']].fillna(0).values.reshape(-1, 1))
-        re[judge, 0] = 0
-        encoded_data['person_work_position'] = re
+        # judge = person_df['new_zoneID'].isna().values
+        # re = self.onehot_encoders[f'position'].transform(person_df[['new_zoneID']].fillna(0).values.reshape(-1, 1))
+        # re[judge, 0] = 0
+        # encoded_data['person_work_position'] = re
+
+        encoded_data['person_work_position'] = person_df[['new_zoneID']].fillna(2006).astype(int).values.reshape(-1)
             
         return encoded_data
     
@@ -167,8 +170,10 @@ class PopulationDataEncoder:
             encoded = self.onehot_encoders[f'activity_{col}'].transform(data_to_encode)
             # encoded是二维数组，每行是一个样本的one-hot向量
             encoded_data[f'activity_{col}'] = encoded
-        encoded_data['activity_start_position'] = self.onehot_encoders[f'position'].transform(activity_df[['origin_tazID']].astype(int))
-        encoded_data['activity_end_position'] = self.onehot_encoders[f'position'].transform(activity_df[['destination_tazID']].astype(int))
+        # encoded_data['activity_start_position'] = self.onehot_encoders[f'position'].transform(activity_df[['origin_tazID']].astype(int))
+        # encoded_data['activity_end_position'] = self.onehot_encoders[f'position'].transform(activity_df[['destination_tazID']].astype(int))
+        encoded_data['activity_start_position'] = activity_df[['origin_tazID']].astype(int).values.reshape(-1)
+        encoded_data['activity_end_position'] = activity_df[['destination_tazID']].astype(int).values.reshape(-1)
         
 
         return encoded_data
@@ -466,7 +471,7 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
             family_features.extend(onehot_vector.tolist())
         family_features.extend([family_encoded['family_cluster'][family_idx]])  # 添加聚类标签
         family_features.extend([val for val in family_encoded['cluster_profile'][family_idx]])  # 添加聚类特征
-        family_features.extend(family_encoded['family_position'][family_idx].tolist())  # 添加位置one-hot编码
+        family_features.append(family_encoded['family_position'][family_idx])  # 添加位置one-hot编码
         # 成员信息
         family_members = person_df[person_df['家庭编号'] == family_id]
         family_members = family_members.sort_values('age', ascending=False)
@@ -482,7 +487,7 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
                 onehot_vector = person_encoded[f'person_{col}'][member.name]
                 member_feature.extend(onehot_vector.tolist())
             member_feature.append(1) # 标记为有效成员
-            member_feature.extend(person_encoded['person_work_position'][member.name].tolist()) # 工作地点one-hot编码
+            member_feature.append(person_encoded['person_work_position'][member.name]) # 工作地点one-hot编码
             member_features.extend(member_feature)
             member_info = family_members[family_members.index == member.name][['家庭编号','成员编号']].values[0]
             member_activity = activity_df[(activity_df['家庭编号'] == member_info[0]) & (activity_df['家庭成员编号'] == member_info[1])].sort_values('出行序号')
@@ -490,8 +495,11 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
             if len(member_activity) == 0:
                 # 如果没有活动链，填充全0
                 max_activity_chain_length = 6
-                activity_feature_dim = len(encoder.activity_continuous_cols) + sum(encoder.activity_categorical_dims) + 2 * 2006
-                activity_features.extend([0] * (max_activity_chain_length * activity_feature_dim))
+                activity_feature_dim = len(encoder.activity_continuous_cols) + sum(encoder.activity_categorical_dims) + 1 + 1 #start_position_index + end_position_index
+                feature_list = [0] * (activity_feature_dim-2)
+                feature_list.append(2006)  # start_position_index
+                feature_list.append(2006)  # end_position_index
+                activity_features.extend(feature_list * max_activity_chain_length)
             else:
                 for _, activity in member_activity.iterrows():
                     activity_feature = []
@@ -502,16 +510,18 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
                     for col in encoder.activity_categorical_cols:
                         onehot_vector = activity_encoded[f'activity_{col}'][activity.name]
                         activity_feature.extend(onehot_vector.tolist())
-                    activity_feature.extend(activity_encoded['activity_start_position'][activity.name].tolist())  # 出发位置one-hot编码
-                    activity_feature.extend(activity_encoded['activity_end_position'][activity.name].tolist())  # 到达位置one-hot编码
+                    activity_feature.append(activity_encoded['activity_start_position'][activity.name])  # 出发位置index
+                    activity_feature.append(activity_encoded['activity_end_position'][activity.name])  # 到达位置index
                     activity_features.extend(activity_feature)
                 # 填充到最大活动链长度
                 max_activity_chain_length = 6
                 current_activities = len(member_activity)
-                activity_feature_dim = len(encoder.activity_continuous_cols) + sum(encoder.activity_categorical_dims) + 2 * 2006
+                activity_feature_dim = len(encoder.activity_continuous_cols) + sum(encoder.activity_categorical_dims) + 1 + 1 #start_position_index + end_position_index
                 if current_activities < max_activity_chain_length:
-                    padding_size = (max_activity_chain_length - current_activities) * activity_feature_dim
-                    activity_features.extend([0] * padding_size)  
+                    feature_list = [0] * (activity_feature_dim-2)
+                    feature_list.append(2006)  # start_position_index
+                    feature_list.append(2006)  # end_position_index
+                    activity_features.extend(feature_list * (max_activity_chain_length - current_activities))
         
         # 填充到最大家庭大小
         current_members = len(family_members)
@@ -520,11 +530,16 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
         
         if current_members < max_family_size:
             # 用0填充缺失成员
-            padding_size = (max_family_size - current_members) * (person_feature_dim + 1 + 2006) # 标记无效成员
-            member_features.extend([0] * padding_size)
+            feature_list = [0] * (person_feature_dim + 1)
+            feature_list.append(2007)  # work_position_index
 
-            padding_size_activity = (max_family_size - current_members) * max_activity_chain_length * activity_feature_dim
-            activity_features.extend([0] * padding_size_activity)
+            member_features.extend(feature_list * (max_family_size - current_members))
+            # 活动链也需要填充
+            feature_list = [0] * (activity_feature_dim-2)
+            feature_list.append(2006)  # start_position_index
+            feature_list.append(2006)  # end_position_index
+
+            activity_features.extend(feature_list * (max_family_size - current_members) * max_activity_chain_length)
         elif current_members > max_family_size:
             # 截断超出的成员
             member_features = member_features[:max_family_size * (person_feature_dim+ 1 + 2006)]
@@ -535,7 +550,7 @@ def create_population_dataset(family_df, person_df, activity_df, encoder, cluste
         activity_family.append(activity_features)
     
     # 计算正确的reshape维度
-    person_feature_dim = 1 + sum(encoder.person_categorical_dims) + 1 + 2006 # +1 for valid member flag
+    person_feature_dim = 1 + sum(encoder.person_categorical_dims) + 1 + 1 # +1 for valid member flag
     
     return (torch.tensor(family_samples, dtype=torch.float32), 
             torch.tensor(member_samples, dtype=torch.float32).view(len(member_samples), max_family_size, person_feature_dim),
