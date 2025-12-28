@@ -75,9 +75,11 @@ class ZoneEmbeddingModule(nn.Module):
         zone_ids = torch.arange(self.num_zones, device=self.zone_embed.weight.device)
 
         embed = self.zone_embed(zone_ids)                    # [num_zones, embed_dim]
+        a = torch.isnan(embed).sum()
         lda = self.zone_lda[:self.num_zones]                 # [num_zones, n_topics]
+        b = torch.isnan(lda).sum()
         affordance = self.zone_affordance[:self.num_zones]   # [num_zones, n_purposes]
-
+        c = torch.isnan(affordance).sum()
         combined = torch.cat([embed, lda, affordance], dim=-1)
         return self.zone_proj(combined)  # [num_zones, d_model]
 
@@ -122,3 +124,246 @@ class ZoneEmbeddingModule(nn.Module):
         scores = torch.einsum('...p,np->...n', probs, aff)
 
         return scores
+
+
+class FamilyMemberZoneEmbedding(nn.Module):
+    """
+    家庭和成员的位置嵌入模块
+
+    - 家庭位置（home_zone）: 融入家庭特征
+    - 成员工作位置（work_zone）: 融入成员特征
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        num_zones = config.num_zones
+        embed_dim = config.zone_embed_dim
+        n_lda = config.n_lda_topics
+        n_affordance = config.n_affordance_purposes
+
+        self.vocab_size = num_zones + 2  # 0-2005: 真实zone, 2006: NONE, 2007: PADDING
+        self.zone_none = num_zones
+        self.zone_padding = num_zones + 1
+
+        # ===== 共享的zone基础嵌入 =====
+        self.zone_embed = nn.Embedding(self.vocab_size, embed_dim)
+        self._init_embeddings()
+
+        # ===== 外部特征 =====
+        self.register_buffer('zone_lda', torch.zeros(self.vocab_size, n_lda))
+        self.register_buffer('zone_affordance', torch.zeros(self.vocab_size, n_affordance))
+
+        # 外部特征投影
+        self.external_proj = nn.Sequential(
+            nn.Linear(n_lda + n_affordance, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
+        # ===== 家庭位置专用处理 =====
+        self.home_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # ===== 工作位置专用处理 =====
+        self.work_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # 无工作的特殊嵌入（可学习）
+        self.no_work_embed = nn.Parameter(torch.zeros(embed_dim))
+        nn.init.normal_(self.no_work_embed, std=0.02)
+
+    def _init_embeddings(self):
+        nn.init.normal_(self.zone_embed.weight[:self.config.num_zones], mean=0, std=0.02)
+        nn.init.zeros_(self.zone_embed.weight[self.zone_none])
+        nn.init.zeros_(self.zone_embed.weight[self.zone_padding])
+
+    def load_external_features(self, lda_matrix, affordance_matrix):
+        """加载外部特征"""
+        device = self.zone_embed.weight.device
+        self.zone_lda[:self.config.num_zones] = torch.from_numpy(lda_matrix).float().to(device)
+        self.zone_affordance[:self.config.num_zones] = torch.from_numpy(affordance_matrix).float().to(device)
+
+    def _get_zone_features(self, zone_ids):
+        """获取zone的完整特征（嵌入 + 外部特征）"""
+        embed = self.zone_embed(zone_ids)
+        lda = self.zone_lda[zone_ids]
+        aff = self.zone_affordance[zone_ids]
+        external = self.external_proj(torch.cat([lda, aff], dim=-1))
+        return torch.cat([embed, external], dim=-1)  # [*, embed_dim * 2]
+
+    def get_home_embedding(self, home_zones):
+        """
+        获取家庭位置嵌入
+
+        Args:
+            home_zones: [B] 家庭住址zone ID
+        Returns:
+            [B, embed_dim] 家庭位置嵌入
+        """
+        features = self._get_zone_features(home_zones)  # [B, embed_dim * 2]
+        return self.home_proj(features)  # [B, embed_dim]
+
+    def get_work_embedding(self, work_zones):
+        """
+        获取工作位置嵌入
+
+        Args:
+            work_zones: [B, M] 成员工作地zone ID (2006表示无工作, 2007表示padding成员)
+        Returns:
+            [B, M, embed_dim] 工作位置嵌入
+        """
+        # 识别有效工作位置
+        has_work = work_zones < self.zone_none  # [B, M]
+
+        # 获取所有位置的特征
+        features = self._get_zone_features(work_zones)  # [B, M, embed_dim * 2]
+        work_embed = self.work_proj(features)  # [B, M, embed_dim]
+
+        # 对于无工作的成员，使用特殊嵌入
+        no_work = self.no_work_embed.expand_as(work_embed)
+        work_embed = torch.where(has_work.unsqueeze(-1), work_embed, no_work)
+
+        return work_embed  # [B, M, embed_dim]
+
+
+class ActivityZoneEmbedding(nn.Module):
+    """
+    活动起终点位置嵌入模块
+
+    - origin_zone: 活动出发地
+    - destination_zone: 活动目的地
+
+    注意：origin由上一个活动的destination决定（第一个活动的origin是home）
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        num_zones = config.num_zones
+        embed_dim = config.zone_embed_dim
+        n_lda = config.n_lda_topics
+        n_affordance = config.n_affordance_purposes
+
+        self.vocab_size = num_zones + 1
+        self.zone_none = num_zones
+
+        # ===== 共享的zone基础嵌入 =====
+        self.zone_embed = nn.Embedding(self.vocab_size, embed_dim)
+        self._init_embeddings()
+
+        # ===== 外部特征 =====
+        self.register_buffer('zone_lda', torch.zeros(self.vocab_size, n_lda))
+        self.register_buffer('zone_affordance', torch.zeros(self.vocab_size, n_affordance))
+
+        # 外部特征投影
+        self.external_proj = nn.Sequential(
+            nn.Linear(n_lda + n_affordance, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
+        # ===== Origin位置处理 =====
+        self.origin_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # ===== Destination位置处理 =====
+        self.destination_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # 无效位置的特殊嵌入（padding活动）
+        self.invalid_origin_embed = nn.Parameter(torch.zeros(embed_dim))
+        self.invalid_dest_embed = nn.Parameter(torch.zeros(embed_dim))
+        nn.init.normal_(self.invalid_origin_embed, std=0.02)
+        nn.init.normal_(self.invalid_dest_embed, std=0.02)
+
+    def _init_embeddings(self):
+        nn.init.normal_(self.zone_embed.weight[:self.config.num_zones], mean=0, std=0.02)
+        nn.init.zeros_(self.zone_embed.weight[self.zone_none])
+
+    def load_external_features(self, lda_matrix, affordance_matrix):
+        """加载外部特征"""
+        device = self.zone_embed.weight.device
+        self.zone_lda[:self.config.num_zones] = torch.from_numpy(lda_matrix).float().to(device)
+        self.zone_affordance[:self.config.num_zones] = torch.from_numpy(affordance_matrix).float().to(device)
+
+    def _get_zone_features(self, zone_ids):
+        """获取zone的完整特征"""
+        # 处理可能的越界
+        safe_ids = zone_ids.clamp(0, self.vocab_size - 1)
+        embed = self.zone_embed(safe_ids)
+        lda = self.zone_lda[safe_ids]
+        aff = self.zone_affordance[safe_ids]
+        external = self.external_proj(torch.cat([lda, aff], dim=-1))
+        return torch.cat([embed, external], dim=-1)
+
+    def get_origin_embedding(self, origin_zones):
+        """
+        获取出发地嵌入
+
+        Args:
+            origin_zones: [B, M, T] 或 [B, M] 出发地zone ID
+        Returns:
+            同形状 + embed_dim 的嵌入
+        """
+        valid_mask = origin_zones < self.zone_none
+
+        features = self._get_zone_features(origin_zones)
+        origin_embed = self.origin_proj(features)
+
+        # 无效位置使用特殊嵌入
+        invalid_embed = self.invalid_origin_embed.expand_as(origin_embed)
+        origin_embed = torch.where(valid_mask.unsqueeze(-1), origin_embed, invalid_embed)
+
+        return origin_embed
+
+    def get_destination_embedding(self, dest_zones):
+        """
+        获取目的地嵌入
+
+        Args:
+            dest_zones: [B, M, T] 或 [B, M] 目的地zone ID
+        Returns:
+            同形状 + embed_dim 的嵌入
+        """
+        valid_mask = dest_zones < self.zone_none
+
+        features = self._get_zone_features(dest_zones)
+        dest_embed = self.destination_proj(features)
+
+        # 无效位置使用特殊嵌入
+        invalid_embed = self.invalid_dest_embed.expand_as(dest_embed)
+        dest_embed = torch.where(valid_mask.unsqueeze(-1), dest_embed, invalid_embed)
+
+        return dest_embed
+
+    def forward(self, origin_zones, dest_zones):
+        """
+        获取起终点嵌入
+
+        Args:
+            origin_zones: [B, M, T] 出发地
+            dest_zones: [B, M, T] 目的地
+        Returns:
+            origin_embed: [B, M, T, embed_dim]
+            dest_embed: [B, M, T, embed_dim]
+        """
+        origin_embed = self.get_origin_embedding(origin_zones)
+        dest_embed = self.get_destination_embedding(dest_zones)
+        return origin_embed, dest_embed

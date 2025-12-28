@@ -248,7 +248,9 @@ class ScheduledSamplingDecoder(nn.Module):
         member_mask: torch.BoolTensor,
         activity_mask: torch.BoolTensor,
         training: bool = True,
-        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增
+        pattern_outputs: Dict[str, torch.Tensor] = None,  # 新增
+        home_zones = None,
+        target_destinations = None
     ) -> Dict[str, torch.Tensor]:
         """
         带 Scheduled Sampling 的前向传播
@@ -283,14 +285,18 @@ class ScheduledSamplingDecoder(nn.Module):
             return self.decoder(
                 member_repr, family_repr, activities_input,
                 member_mask, activity_mask,
-                pattern_outputs=pattern_outputs
+                pattern_outputs=pattern_outputs,
+                home_zones = home_zones,
+                target_destinations = target_destinations
             )
         
         # 混合模式: 逐步决定使用真实标签还是预测
         return self._forward_scheduled_sampling(
             member_repr, family_repr, target_activities,
             member_mask, activity_mask, tf_prob,
-            pattern_outputs=pattern_outputs
+            pattern_outputs=pattern_outputs,
+            home_zones=home_zones,
+            target_destinations=target_destinations
         )
     
     def _forward_scheduled_sampling(
@@ -321,7 +327,8 @@ class ScheduledSamplingDecoder(nn.Module):
             'purpose': [],
             'mode': [],
             'driver': [],
-            'joint': []
+            'joint': [],
+            'destination': []  # 新增
         }
         
         # 准备任务特定注意力和 Cross-Role 注意力
@@ -334,7 +341,12 @@ class ScheduledSamplingDecoder(nn.Module):
         
         # 上一个活动时间 (用于时间约束)
         prev_continuous = torch.zeros(batch_size, max_members, 2, device=device)
-        
+
+        # 记录上一个活动的目的地 (用于下一活动的起点)
+        if self.decoder.use_destination and home_zones is not None:
+            prev_destination = home_zones.unsqueeze(1).expand(-1, max_members)  # [B, M]
+        else:
+            prev_destination = None
         for t in range(max_activities):
             # 位置编码
             seq_len = current_input.size(2)
@@ -398,14 +410,11 @@ class ScheduledSamplingDecoder(nn.Module):
                                              origin_zones=current_origin
                                              )
 
-            # 获取预测的destination
-            if 'destination' in step_pred:
-                pred_destination = step_pred['destination'].argmax(dim=-1)  # [B, M]
-                prev_destination = pred_destination  # 更新为下一步的origin
-            step_pred = self.decoder.output_heads(last_hidden,
-                                                  pattern_outputs['family_pattern_prob'],
-                                                  pattern_outputs['individual_pattern_prob']
-                                                  )
+
+            # step_pred = self.decoder.output_heads(last_hidden,
+            #                                       pattern_outputs['family_pattern_prob'],
+            #                                       pattern_outputs['individual_pattern_prob']
+            #                                       )
             
             # 时间约束
             is_first = (t == 0)
@@ -423,6 +432,8 @@ class ScheduledSamplingDecoder(nn.Module):
             all_predictions['mode'].append(step_pred['mode'])
             all_predictions['driver'].append(step_pred['driver'])
             all_predictions['joint'].append(step_pred['joint'])
+            if 'destination' in step_pred:
+                all_predictions['destination'].append(step_pred['destination'])
             
             # 决定下一步输入: teacher forcing 还是用预测
             if t < max_activities - 1:
@@ -439,10 +450,10 @@ class ScheduledSamplingDecoder(nn.Module):
                 pred_mode_idx = step_pred['mode'].argmax(dim=-1)
                 pred_driver_idx = step_pred['driver'].argmax(dim=-1)
                 pred_joint_idx = step_pred['joint'].argmax(dim=-1)
-                
+
                 pred_emb = self.decoder.activity_embedding.embed_from_indices(
                     pred_continuous, pred_purpose_idx, pred_mode_idx,
-                    pred_driver_idx, pred_joint_idx
+                    pred_driver_idx, pred_joint_idx, current_origin, prev_destination
                 )
                 
                 # 混合
@@ -475,6 +486,15 @@ class ScheduledSamplingDecoder(nn.Module):
                     real_activity[..., :2],
                     pred_continuous
                 )
+                # 更新 prev_destination
+                if self.decoder.use_destination and 'destination' in step_pred:
+                    pred_destination = step_pred['destination'].argmax(dim=-1)  # [B, M]
+                    real_destination = target_activities[:, :, t, -1].long()  # [B, M]
+                    prev_destination = torch.where(
+                        use_teacher.squeeze(-1),
+                        real_destination,
+                        pred_destination
+                    )
         
         # 堆叠结果
         return {
@@ -482,7 +502,8 @@ class ScheduledSamplingDecoder(nn.Module):
             'purpose': torch.stack(all_predictions['purpose'], dim=2),
             'mode': torch.stack(all_predictions['mode'], dim=2),
             'driver': torch.stack(all_predictions['driver'], dim=2),
-            'joint': torch.stack(all_predictions['joint'], dim=2)
+            'joint': torch.stack(all_predictions['joint'], dim=2),
+            'destination': torch.stack(all_predictions['destination'], dim=2) if all_predictions['destination'] else None
         }
     
     def _construct_activity_tensor(
@@ -587,7 +608,7 @@ class ExposureBiasTrainer:
         """
         # 编码
         member_repr, family_repr, pattern_prob = self.model.encoder(
-            batch.family_attr, batch.member_attr, batch.member_mask
+            batch.family_attr, batch.member_attr, batch.member_mask, batch.home_zones, batch.work_positions
         )
         
         # 解码 (使用 Scheduled Sampling)
@@ -595,7 +616,9 @@ class ExposureBiasTrainer:
             member_repr, family_repr, batch.activities,
             batch.member_mask, batch.activity_mask,
             training=True,
-            pattern_outputs=pattern_prob  # 传递模式概率
+            pattern_outputs=pattern_prob,  # 传递模式概率,
+            home_zones=batch.home_zones,
+            target_destinations=batch.target_destinations
         )
         pattern_prob.update({
             'family_pattern_target': batch.family_pattern,

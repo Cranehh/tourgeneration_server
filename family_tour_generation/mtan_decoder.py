@@ -492,10 +492,13 @@ class OutputHeads(nn.Module):
     """
 
     def __init__(self, config: ModelConfig,
+                 zone_module=None,  # ← 新增参数
                  num_family_patterns: int = 118,
                  num_individual_patterns: int = 207):
         super().__init__()
         self.config = config
+        self.zone_module = zone_module  # ← 新增
+        self.use_destination = zone_module is not None  # ← 新增
         self.num_family_patterns = num_family_patterns
         self.num_individual_patterns = num_individual_patterns
 
@@ -608,7 +611,7 @@ class OutputHeads(nn.Module):
         if self.use_destination and origin_zones is not None:
             dest_logits = self._predict_destination(
                 hidden=hidden,
-                purpose_logits=purpose_logits,
+                purpose_logits=purpose_logits[0],
                 origin_zones=origin_zones
             )
             results['destination'] = dest_logits
@@ -627,32 +630,34 @@ class OutputHeads(nn.Module):
         """
         # 1. 获取origin的嵌入
         origin_embed = self.zone_module.get_zone_embedding(origin_zones)  # [..., zone_embed_dim]
-
+        a = torch.isnan(origin_embed).sum()
         # 2. 获取purpose概率
         purpose_probs = F.softmax(purpose_logits, dim=-1)  # [..., num_purposes]
 
         # 3. 构建Query（融合hidden + origin + purpose）
         query_input = torch.cat([hidden, origin_embed, purpose_probs], dim=-1)
         query = self.dest_query_proj(query_input)  # [..., d_model]
+        b= torch.isnan(query).sum()
 
         # 4. 获取所有zone的Key
         zone_keys = self.zone_module.get_all_zone_keys()  # [num_zones, d_model]
+        c1 = torch.isnan(zone_keys).sum()
         zone_keys = self.dest_key_proj(zone_keys)  # [num_zones, d_model]
-
+        c = torch.isnan(zone_keys).sum()
         # 5. 计算注意力分数
         # query: [..., d_model], zone_keys: [num_zones, d_model]
         d_k = query.size(-1)
         attn_scores = torch.einsum('...d,nd->...n', query, zone_keys) / (d_k ** 0.5)
         # attn_scores: [..., num_zones]
-
+        d = torch.isnan(attn_scores).sum()
         # 6. 添加空间阻抗偏置（距离越远，分数越低）
         impedance = self.zone_module.get_impedance(origin_zones)  # [..., num_zones]
         attn_scores = attn_scores - self.impedance_scale * impedance
-
+        e = torch.isnan(attn_scores).sum()
         # 7. 添加affordance偏置（活动类型匹配度）
         affordance_scores = self.zone_module.get_affordance_scores(purpose_probs)  # [..., num_zones]
         attn_scores = attn_scores + self.affordance_scale * affordance_scores
-
+        f = torch.isnan(attn_scores).sum()
         return attn_scores  # 返回logits，不做softmax
 
 
@@ -720,9 +725,20 @@ class MTANDecoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        
-        # 活动嵌入
-        self.activity_embedding = ActivityEmbedding(config)
+
+        # ===== 新增：先创建zone模块 =====
+        self.use_destination = getattr(config, 'use_destination_prediction', False)
+        if self.use_destination:
+            from zone_embedding import ActivityZoneEmbedding
+            self.activity_zone_module = ActivityZoneEmbedding(config)
+        else:
+            self.activity_zone_module = None
+
+        # ===== 修改：传入zone模块 =====
+        self.activity_embedding = ActivityEmbedding(
+            config,
+            zone_embedding_module=self.activity_zone_module  # ← 新增
+        )
         
         # 位置编码
         self.pos_encoding = PositionalEncoding(config.d_model, config.max_activities, config.dropout)
@@ -829,11 +845,10 @@ class MTANDecoder(nn.Module):
         activity_emb = self.pos_encoding(activity_emb)
         activity_emb = activity_emb.view(batch_size, max_members, max_activities, -1)
 
-        nan_activity_emb = torch.isnan(activity_emb).sum()
 
         # 准备decoder输入: shift right, 加入start token
         start_tokens = self.start_token.expand(batch_size, max_members, 1, -1)
-        nan_start_tokens = torch.isnan(start_tokens).sum()
+
         decoder_input = torch.cat([start_tokens, activity_emb[:, :, :-1, :]], dim=2)
         # (batch, max_members, max_activities, d_model)
         
@@ -842,17 +857,16 @@ class MTANDecoder(nn.Module):
         member_states = decoder_input.mean(dim=2)  # (batch, max_members, d_model)
         member_states = member_states.clone() + member_repr  # 加入PLE编码
         member_states = self.task_attention(member_states, family_repr)
-        nan_member_states = torch.isnan(member_states).sum()
-        nan_member_repr = torch.isnan(member_repr).sum()
+
         
         # Cross-Role注意力: 成员间交互
         # TODO:这一步有问题
         member_states = self.cross_role_attention(member_states, member_mask)
-        nan_member_states = torch.isnan(member_states).sum()
+
         # 将成员上下文融入decoder输入
         member_context = member_states.unsqueeze(2).expand(-1, -1, max_activities, -1)
         decoder_input = decoder_input.clone() + member_context
-        nan_member_context = torch.isnan(member_context).sum()
+
         
         # 准备memory (来自成员表示和家庭表示)
         # 将member_repr作为memory
@@ -861,7 +875,6 @@ class MTANDecoder(nn.Module):
         # Transformer Decoder
         # 需要处理每个成员的序列
         # 重塑为 (batch * max_members, max_activities, d_model)
-        nan_decoder_input = torch.isnan(decoder_input).sum()
         decoder_input_flat = decoder_input.view(batch_size * max_members, max_activities, -1)
         memory_flat = memory.unsqueeze(2).expand(-1, -1, max_activities, -1)
         memory_flat = memory_flat.view(batch_size * max_members, max_activities, -1)
@@ -1104,10 +1117,7 @@ class MTANDecoder(nn.Module):
                                         origin_zones=prev_destination
                                         )
 
-            # 获取预测的destination
-            if 'destination' in step_pred:
-                generated_destination.append(step_pred['destination'])
-                prev_destination = step_pred['destination'].argmax(dim=-1)
+
             # 应用时间约束
             is_first = (t == 0)
             is_first_tensor = torch.full(
@@ -1140,8 +1150,15 @@ class MTANDecoder(nn.Module):
                 step_pred['purpose'].argmax(dim=-1),
                 step_pred['mode'].argmax(dim=-1),
                 step_pred['driver'].argmax(dim=-1),
-                step_pred['joint'].argmax(dim=-1)
+                step_pred['joint'].argmax(dim=-1),
+                prev_destination,
+                step_pred['destination'].argmax(dim=-1)
             )  # (batch, max_members, d_model)
+
+            # 获取预测的destination
+            if 'destination' in step_pred:
+                generated_destination.append(step_pred['destination'])
+                prev_destination = step_pred['destination'].argmax(dim=-1)
             
             current_input = torch.cat([
                 current_input, 
@@ -1281,10 +1298,6 @@ def autoregressive_rollout(
             origin_zones=prev_destination  # ← 新增
         )
 
-        # 获取预测的destination
-        if 'destination' in step_pred:
-            rollout_preds['destination'].append(step_pred['destination'])
-            prev_destination = step_pred['destination'].argmax(dim=-1)
 
         # 时间约束
         is_first = (start_pos + t == 0)
@@ -1306,8 +1319,16 @@ def autoregressive_rollout(
             step_pred['purpose'].argmax(dim=-1),
             step_pred['mode'].argmax(dim=-1),
             step_pred['driver'].argmax(dim=-1),
-            step_pred['joint'].argmax(dim=-1)
+            step_pred['joint'].argmax(dim=-1),
+            prev_destination,
+            step_pred['destination'].argmax(dim=-1)
+
+
         )
+        # 获取预测的destination
+        if 'destination' in step_pred:
+            rollout_preds['destination'].append(step_pred['destination'])
+            prev_destination = step_pred['destination'].argmax(dim=-1)
         current_input = torch.cat([current_input, next_emb.unsqueeze(2)], dim=2)
         prev_continuous = step_pred['continuous']
 

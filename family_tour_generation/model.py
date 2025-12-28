@@ -41,8 +41,10 @@ class FamilyTourGenerator(nn.Module):
         
         # PLE编码器
         self.encoder = PLEEncoder(config)
-        
+
         # MTAN Decoder
+
+        self.decoder = MTANDecoder(config)
     def forward(
         self,
         batch: FamilyTourBatch,
@@ -67,7 +69,9 @@ class FamilyTourGenerator(nn.Module):
         member_repr, family_repr, pattern_probs = self.encoder(
             batch.family_attr,
             batch.member_attr,
-            batch.member_mask
+            batch.member_mask,
+            batch.home_zones,
+            batch.work_positions
         )
         
         if teacher_forcing:
@@ -99,7 +103,8 @@ class FamilyTourGenerator(nn.Module):
         member_attr: torch.Tensor,
         member_mask: torch.BoolTensor,
         max_length: int = None,
-        home_zones=None
+        home_zones=None,
+        work_positions=None,
     ) -> Tuple[Dict[str, Tensor], Any]:
         """
         生成活动链 (推理接口)
@@ -115,7 +120,7 @@ class FamilyTourGenerator(nn.Module):
         """
         # PLE编码
         member_repr, family_repr, pattern_prob = self.encoder(
-            family_attr, member_attr, member_mask
+            family_attr, member_attr, member_mask, home_zones, work_positions
         )
         
         # 自回归生成
@@ -125,7 +130,7 @@ class FamilyTourGenerator(nn.Module):
             member_mask=member_mask,
             max_length=max_length,
             pattern_outputs=pattern_prob,
-            home_zones=batch.home_zones), pattern_prob
+            home_zones=home_zones), pattern_prob
     
     def get_encoder_output(
         self,

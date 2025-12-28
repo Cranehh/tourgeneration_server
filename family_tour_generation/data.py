@@ -27,6 +27,7 @@ class FamilyTourBatch:
     # ===== 新增：Zone信息 =====
     home_zones: torch.LongTensor = None  # (B,) 家的zone ID
     target_destinations: torch.LongTensor = None  # (B, M, T) 目标目的地
+    work_positions: torch.Tensor = None  # (B, M) 成员工作地点zone ID
     
     def to(self, device):
         """移动到指定设备"""
@@ -40,6 +41,7 @@ class FamilyTourBatch:
             member_pattern = self.member_pattern.to(device),
             home_zones=self.home_zones.to(device) if self.home_zones is not None else None,
             target_destinations=self.target_destinations.to(device) if self.target_destinations is not None else None,
+            work_positions=self.work_positions.to(device) if self.work_positions is not None else None
         )
     
     @property
@@ -84,15 +86,16 @@ class FamilyTourDataset(Dataset):
         # activity_data: [M, T, Fa], 其中Fa的最后一维是end_position
         target_destinations = self.activity_data[idx, :, :, -1].long()  # [M, T]
         return {
-            'family_attr': self.family_data[idx],
-            'member_attr': self.member_data[idx],
+            'family_attr': self.family_data[idx][:-1],
+            'member_attr': self.member_data[idx][:, :-1],
             'activities': self.activity_data[idx],
             'member_mask': self.member_mask[idx],
             'activity_mask': self.activity_mask[idx],
             'family_pattern': self.family_pattern[idx],
             'member_pattern': self.member_pattern[idx],
             'home_zone': torch.tensor(home_zone, dtype=torch.long),           # 新增
-            'target_destinations': target_destinations
+            'target_destinations': target_destinations,
+            'work_positions': torch.tensor(self.member_data[idx][:, -1], dtype=torch.long)
         }
 
 
@@ -108,6 +111,7 @@ def collate_fn(batch: List[Dict]) -> FamilyTourBatch:
         member_pattern=torch.stack([b['member_pattern'] for b in batch]),
         home_zones=torch.stack([b['home_zone'] for b in batch]),  # 新增
         target_destinations=torch.stack([b['target_destinations'] for b in batch]),
+        work_positions=torch.stack([b['work_positions'] for b in batch])
     )
 
 

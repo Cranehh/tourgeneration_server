@@ -414,12 +414,33 @@ class PLEEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(config.d_model, 3)
             )
+        # ===== 新增：位置嵌入模块 =====
+        self.use_zone_embedding = getattr(config, 'use_destination_prediction', False)
+        if self.use_zone_embedding:
+            from zone_embedding import FamilyMemberZoneEmbedding
+            self.zone_embedding = FamilyMemberZoneEmbedding(config)
+
+            # 家庭特征融合层（原始特征 + home嵌入）
+            self.family_zone_fusion = nn.Sequential(
+                nn.Linear(config.family_dim + config.zone_embed_dim, config.family_dim),
+                nn.ReLU(),
+                nn.LayerNorm(config.family_dim)
+            )
+
+            # 成员特征融合层（原始特征 + work嵌入）
+            self.member_zone_fusion = nn.Sequential(
+                nn.Linear(config.member_dim + config.zone_embed_dim, config.member_dim),
+                nn.ReLU(),
+                nn.LayerNorm(config.member_dim)
+            )
     
     def forward(
         self, 
         family_attr: torch.Tensor, 
         member_attr: torch.Tensor, 
-        member_mask: torch.BoolTensor
+        member_mask: torch.BoolTensor,
+        home_zones: torch.Tensor = None,  # [B] 新增
+        work_zones: torch.Tensor = None  # [B, M] 新增
     ) -> tuple:
         """
         Args:
@@ -431,6 +452,20 @@ class PLEEncoder(nn.Module):
             member_repr: (batch, max_members, d_model) 每个成员的融合表示
             family_repr: (batch, d_model) 家庭级表示
         """
+        # ===== 新增：融合位置嵌入到输入特征 =====
+        if self.use_zone_embedding and home_zones is not None and work_zones is not None:
+            # 家庭位置嵌入
+            home_embed = self.zone_embedding.get_home_embedding(home_zones)  # [B, embed_dim]
+            family_attr = self.family_zone_fusion(
+                torch.cat([family_attr, home_embed], dim=-1)
+            )  # [B, family_dim]
+
+            # 工作位置嵌入
+            work_embed = self.zone_embedding.get_work_embedding(work_zones)  # [B, M, embed_dim]
+            member_attr = self.member_zone_fusion(
+                torch.cat([member_attr, work_embed], dim=-1)
+            )  # [B, M, member_dim]
+
         batch_size, max_members, _ = member_attr.shape
         
         # 共享专家1: 家庭级表示

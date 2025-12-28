@@ -15,9 +15,11 @@ class ActivityEmbedding(nn.Module):
     输出: (*, d_model)
     """
     
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, zone_embedding_module: nn.Module = None):
         super().__init__()
         self.config = config
+        self.zone_embedding_module = zone_embedding_module  # ← 新增
+        self.use_zone_embedding = zone_embedding_module is not None  # ← 新增
         
         # 连续属性投影 (开始时间z-score, 结束时间z-score)
         self.continuous_proj = nn.Sequential(
@@ -31,16 +33,21 @@ class ActivityEmbedding(nn.Module):
         self.mode_emb = nn.Embedding(config.num_modes, config.d_emb)
         self.driver_emb = nn.Embedding(config.num_driver_status, config.d_emb)
         self.joint_emb = nn.Embedding(config.num_joint_status, config.d_emb)
-        
+
+        if self.use_zone_embedding:
+            fusion_input_dim = 5 * config.d_emb + 2 * config.zone_embed_dim
+        else:
+            fusion_input_dim = 5 * config.d_emb
+
         # 融合投影: 5 * d_emb -> d_model
         self.fusion_proj = nn.Sequential(
-            nn.Linear(5 * config.d_emb, config.d_model),
+            nn.Linear(fusion_input_dim, config.d_model),
             nn.ReLU(),
             nn.Linear(config.d_model, config.d_model),
             nn.LayerNorm(config.d_model)
         )
     
-    def forward(self, activities: torch.Tensor) -> torch.Tensor:
+    def forward(self, activities: torch.Tensor, origin_zones=None, dest_zones=None) -> torch.Tensor:
         """
         Args:
             activities: (*, 27) 活动特征
@@ -55,39 +62,46 @@ class ActivityEmbedding(nn.Module):
         """
         # 保存原始形状
         original_shape = activities.shape[:-1]
-        activities = activities.reshape(-1, self.config.activity_dim)
+        # activities = activities.reshape(-1, self.config.activity_dim)
+
+        # ===== 现有代码：处理各属性 =====
+        # 连续属性
+        continuous = activities[..., :2]
+        continuous_emb = self.continuous_proj(continuous)
+
+        # 离散属性（从one-hot转为index）
+        purpose_idx = activities[..., 2:12].argmax(dim=-1)
+        mode_idx = activities[..., 12:23].argmax(dim=-1)
+        driver_idx = activities[..., 23:25].argmax(dim=-1)
+        joint_idx = activities[..., 25:27].argmax(dim=-1)
+
+        purpose_emb = self.purpose_emb(purpose_idx)
+        mode_emb = self.mode_emb(mode_idx)
+        driver_emb = self.driver_emb(driver_idx)
+        joint_emb = self.joint_emb(joint_idx)
+
+        # ===== 新增：处理起终点嵌入 =====
+        if self.use_zone_embedding:
+            # 如果没有显式传入，从activities中提取
+            if origin_zones is None:
+                origin_zones = activities[..., -2].long()
+            if dest_zones is None:
+                dest_zones = activities[..., -1].long()
+
+            origin_emb = self.zone_embedding_module.get_origin_embedding(origin_zones)
+            dest_emb = self.zone_embedding_module.get_destination_embedding(dest_zones)
+
+            # 融合所有嵌入
+            combined = torch.cat([
+                continuous_emb, purpose_emb, mode_emb, driver_emb, joint_emb,
+                origin_emb, dest_emb
+            ], dim=-1)
+        else:
+            combined = torch.cat([
+                continuous_emb, purpose_emb, mode_emb, driver_emb, joint_emb
+            ], dim=-1)
         
-        # 分离各属性
-        continuous = activities[:, 0:2]
-        purpose_onehot = activities[:, 2:12]
-        mode_onehot = activities[:, 12:23]
-        driver_onehot = activities[:, 23:25]
-        joint_onehot = activities[:, 25:27]
-        
-        # one-hot 转索引
-        purpose_idx = purpose_onehot.argmax(dim=-1)
-        mode_idx = mode_onehot.argmax(dim=-1)
-        driver_idx = driver_onehot.argmax(dim=-1)
-        joint_idx = joint_onehot.argmax(dim=-1)
-        
-        # 嵌入各属性
-        continuous_emb = self.continuous_proj(continuous)       # (N, d_emb)
-        purpose_emb = self.purpose_emb(purpose_idx)             # (N, d_emb)
-        mode_emb = self.mode_emb(mode_idx)                      # (N, d_emb)
-        driver_emb = self.driver_emb(driver_idx)                # (N, d_emb)
-        joint_emb = self.joint_emb(joint_idx)                   # (N, d_emb)
-        
-        # 拼接并融合
-        combined = torch.cat([
-            continuous_emb, purpose_emb, mode_emb, driver_emb, joint_emb
-        ], dim=-1)  # (N, 5 * d_emb)
-        
-        output = self.fusion_proj(combined)  # (N, d_model)
-        
-        # 恢复形状
-        output = output.view(*original_shape, self.config.d_model)
-        
-        return output
+        return self.fusion_proj(combined)
     
     def embed_from_indices(
         self,
@@ -95,7 +109,9 @@ class ActivityEmbedding(nn.Module):
         purpose_idx: torch.Tensor,
         mode_idx: torch.Tensor,
         driver_idx: torch.Tensor,
-        joint_idx: torch.Tensor
+        joint_idx: torch.Tensor,
+        origin_zones: torch.Tensor = None,  # ← 新增
+        dest_zones: torch.Tensor = None  # ← 新增
     ) -> torch.Tensor:
         """
         从预测的索引构建嵌入（用于自回归生成）
@@ -115,11 +131,20 @@ class ActivityEmbedding(nn.Module):
         mode_emb = self.mode_emb(mode_idx)
         driver_emb = self.driver_emb(driver_idx)
         joint_emb = self.joint_emb(joint_idx)
-        
-        combined = torch.cat([
-            continuous_emb, purpose_emb, mode_emb, driver_emb, joint_emb
-        ], dim=-1)
-        
+
+        if self.use_zone_embedding and origin_zones is not None and dest_zones is not None:
+            origin_emb = self.zone_embedding_module.get_origin_embedding(origin_zones)
+            dest_emb = self.zone_embedding_module.get_destination_embedding(dest_zones)
+
+            combined = torch.cat([
+                continuous_emb, purpose_emb, mode_emb, driver_emb, joint_emb,
+                origin_emb, dest_emb
+            ], dim=-1)
+        else:
+            combined = torch.cat([
+                continuous_emb, purpose_emb, mode_emb, driver_emb, joint_emb
+            ], dim=-1)
+
         return self.fusion_proj(combined)
 
 

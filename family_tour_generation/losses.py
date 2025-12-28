@@ -73,7 +73,12 @@ def destination_loss(
 
     pred_valid = pred_flat[mask_flat]
     target_valid = target_flat[mask_flat]
-
+    a = torch.isnan(pred_valid).any()
+    b = torch.isinf(pred_valid).any()
+    c = pred_valid.min()
+    d = pred_valid.max()
+    e = target_valid.min()
+    f = target_valid.max()
     ce = F.cross_entropy(pred_valid, target_valid, reduction='none')
     pt = torch.exp(-ce)
     focal = focal_alpha * (1 - pt) ** focal_gamma * ce
@@ -211,12 +216,12 @@ class FamilyTourLoss(nn.Module):
                 target_destinations,
                 member_mask,
                 activity_mask,
-                num_zones=getattr(self.config, 'num_zones', 2006),
-                focal_alpha=self.focal_alpha,
-                focal_gamma=self.focal_gamma
+                num_zones=2006,
+                focal_alpha= self.train_config.focal_alpha,
+                focal_gamma= self.train_config.focal_gamma
             )
             losses['destination'] = dest_loss
-            total_loss = total_loss + self.config.loss_weights.get('destination', 1.0) * dest_loss
+            total_loss = total_loss + self.weights.get('destination', 1)
 
         return total_loss, losses
     

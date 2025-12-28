@@ -165,7 +165,7 @@ class ScheduledSamplingTrainer:
         total_loss = 0.0
         total_loss_tf = 0.0
         loss_components = {k: 0.0 for k in self.model_config.loss_weights.keys()}
-        accuracies = {k: 0.0 for k in ['purpose', 'mode', 'driver', 'joint']}
+        accuracies = {k: 0.0 for k in ['start_time', 'end_time', 'purpose', 'mode', 'driver', 'joint','destination']}
         num_batches = 0
 
         for batch_data in tqdm(self.val_loader, desc='Validating'):
@@ -173,7 +173,7 @@ class ScheduledSamplingTrainer:
 
             # 使用纯自回归模式验证 (模拟真实推理)
             predictions, pattern_probs = self.model.generate(
-                batch.family_attr, batch.member_attr, batch.member_mask
+                batch.family_attr, batch.member_attr, batch.member_mask, home_zones=batch.home_zones, work_positions=batch.work_positions
             )
             pattern_probs.update({
                 'family_pattern_target': batch.family_pattern,
@@ -221,20 +221,26 @@ class ScheduledSamplingTrainer:
     def _compute_generation_accuracy(self, predictions, batch):
         """计算生成模式下的准确率"""
         # 解析目标
+        target_start_time = batch.activities[..., 0]
+        target_end_time = batch.activities[..., 1]
         target_purpose = batch.activities[..., 2:12].argmax(dim=-1)
         target_mode = batch.activities[..., 12:23].argmax(dim=-1)
         target_driver = batch.activities[..., 23:25].argmax(dim=-1)
         target_joint = batch.activities[..., 25:27].argmax(dim=-1)
+        target_destination = batch.target_destinations
 
         # 生成的预测已经是索引
         # pred_purpose = predictions['purpose']
         # pred_mode = predictions['mode']
         # pred_driver = predictions['driver']
         # pred_joint = predictions['joint']
+        pred_start_time = predictions['continuous'][..., 0]
+        pred_end_time = predictions['continuous'][..., 1]
         pred_purpose = predictions['purpose'].argmax(dim=-1)
         pred_mode = predictions['mode'].argmax(dim=-1)
         pred_driver = predictions['driver'].argmax(dim=-1)
         pred_joint = predictions['joint'].argmax(dim=-1)
+        pred_destination = predictions['destination'].argmax(dim=-1)
 
         # 截断到相同长度
         max_len = min(pred_purpose.size(2), target_purpose.size(2))
@@ -246,6 +252,13 @@ class ScheduledSamplingTrainer:
             return {k: 0.0 for k in ['purpose', 'mode', 'driver', 'joint']}
 
         acc = {}
+        acc['start_time'] = (
+                                   (torch.abs(pred_start_time[..., :max_len] - target_start_time[..., :max_len])) * valid_mask.float()
+                           ).sum().item() / num_valid
+        acc['end_time'] = (
+                                 (torch.abs(pred_end_time[..., :max_len] - target_end_time[..., :max_len])) * valid_mask.float()
+                         ).sum().item() / num_valid
+
         acc['purpose'] = (
                                  (pred_purpose[..., :max_len] == target_purpose[..., :max_len]) & valid_mask
                          ).sum().item() / num_valid
@@ -258,6 +271,9 @@ class ScheduledSamplingTrainer:
         acc['joint'] = (
                                (pred_joint[..., :max_len] == target_joint[..., :max_len]) & valid_mask
                        ).sum().item() / num_valid
+        acc['destination'] = (
+                                     (pred_destination[..., :max_len] == target_destination[..., :max_len]) & valid_mask
+                             ).sum().item() / num_valid
 
         return acc
 
@@ -343,8 +359,8 @@ def main():
         max_members=8,
         max_activities=6,
         d_model=256,
-        num_heads=8,
-        num_decoder_layers=5,
+        num_heads=16,
+        num_decoder_layers=20,
         num_inducing_points=16,
         dropout = 0.3
     )
@@ -362,12 +378,18 @@ def main():
         data_dir = "../数据"
 
         # 加载预计算的特征
-        lda_matrix = np.load(f'{data_dir}/zone_lda.npy')  # [2006, n_topics]
-        affordance_matrix = np.load(f'{data_dir}/zone_affordance.npy')  # [2006, n_purposes]
-        impedance_matrix = np.load(f'{data_dir}/zone_impedance.npy')  # [2006, 2006]
+        lda_matrix = np.load(f'{data_dir}/position_poi_topic.npy')  # [2006, n_topics]
+        affordance_matrix = np.load(f'{data_dir}/position_activity_value.npy')  # [2006, n_purposes]
+        impedance_matrix = np.load(f'{data_dir}/position_distance.npy')  # [2006, 2006]
 
         model.decoder.zone_module.load_external_features(
             lda_matrix, affordance_matrix, impedance_matrix
+        )
+        model.decoder.activity_zone_module.load_external_features(
+            lda_matrix, affordance_matrix
+        )
+        model.encoder.zone_embedding.load_external_features(
+            lda_matrix, affordance_matrix
         )
         print("Zone external features loaded.")
 
@@ -380,14 +402,15 @@ def main():
     family_data_train = np.concatenate([data[:, :10], data[:, -1:]], axis=1)
     member_data_train = np.load(f'{data_dir}/family_member_sample_improved_cluster_train.npy')
     activity_data_train = np.load(f'{data_dir}/family_activity_train.npy')
-    member_mask_train = member_data_train[:, :, -1]
-    activity_mask_train = activity_data_train.sum(axis=-1) != 0
+    member_mask_train = member_data_train[:, :, -2]
+    activity_mask_train = activity_data_train[:, :, :, :27].sum(axis=-1) != 0
 
-    family_data_test = np.load(f'{data_dir}/family_sample_improved_cluster_test.npy')[:, :10]
+    data = np.load(f'{data_dir}/family_sample_improved_cluster_test.npy')
+    family_data_test = np.concatenate([data[:, :10], data[:, -1:]], axis=1)
     member_data_test = np.load(f'{data_dir}/family_member_sample_improved_cluster_test.npy')
     activity_data_test = np.load(f'{data_dir}/family_activity_test.npy')
-    member_mask_test = member_data_test[:, :, -1] != 0
-    activity_mask_test = activity_data_test.sum(axis=-1) != 0
+    member_mask_test = member_data_test[:, :, -2] != 0
+    activity_mask_test = activity_data_test[:, :, :, :27].sum(axis=-1) != 0
 
     family_pattern_train = np.load(f'{data_dir}/family_pattern_train.npy')
     family_pattern_test = np.load(f'{data_dir}/family_pattern_test.npy')
@@ -440,7 +463,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_multi',
+        save_dir='../checkpoints_ss_with_condition_destination',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
