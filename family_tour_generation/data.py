@@ -95,7 +95,7 @@ class FamilyTourDataset(Dataset):
             'member_pattern': self.member_pattern[idx],
             'home_zone': torch.tensor(home_zone, dtype=torch.long),           # 新增
             'target_destinations': target_destinations,
-            'work_positions': torch.tensor(self.member_data[idx][:, -1], dtype=torch.long)
+            'work_positions': self.member_data[idx][:, -1].long()
         }
 
 

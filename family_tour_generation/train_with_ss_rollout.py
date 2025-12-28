@@ -359,9 +359,10 @@ def main():
         max_members=8,
         max_activities=6,
         d_model=256,
+        d_emb= 256,
         num_heads=16,
-        num_decoder_layers=20,
-        num_inducing_points=16,
+        num_decoder_layers=16,
+        num_inducing_points=32,
         dropout = 0.3
     )
 
