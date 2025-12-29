@@ -40,7 +40,14 @@ class FamilyTourGenerator(nn.Module):
         self.config = config
         
         # PLE编码器
-        self.encoder = PLEEncoder(config)
+        self.encoder = PLEEncoder(
+            config=config,
+            num_family_patterns=getattr(config, 'num_family_patterns', 118),
+            num_individual_patterns=getattr(config, 'num_individual_patterns', 207),
+            num_shared_experts=getattr(config, 'num_shared_experts', 2),
+            num_task_experts=getattr(config, 'num_task_experts', 1),
+            num_cgc_layers=getattr(config, 'num_cgc_layers', 3)
+        )
 
         # MTAN Decoder
 

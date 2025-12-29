@@ -353,21 +353,24 @@ def main():
 
     # 配置
     model_config = ModelConfig(
-        family_dim=10,  # 根据实际数据调整
-        member_dim=51,  # 根据实际数据调整
+        family_dim=10,
+        member_dim=51,
         activity_dim=27,
         max_members=8,
         max_activities=6,
         d_model=256,
-        d_emb= 256,
+        d_emb=256,
         num_heads=16,
         num_decoder_layers=16,
-        num_inducing_points=32,
-        dropout = 0.3
+        num_inducing_points=16,
+        dropout=0.3,
+        num_shared_experts=2,  # 可调整
+        num_task_experts=2,  # 可调整
+        num_cgc_layers=3  # 可调整
     )
 
     train_config = TrainConfig(
-        batch_size=150,
+        batch_size=100,
         learning_rate=1e-4,
         num_epochs=500
     )
@@ -464,7 +467,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_destination',
+        save_dir='../checkpoints_ss_with_condition_newple',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

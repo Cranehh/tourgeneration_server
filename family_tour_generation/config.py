@@ -35,6 +35,11 @@ class ModelConfig:
     
     # PLE配置
     num_inducing_points: int = 16  # Set Transformer诱导点数量
+
+    # ===== 新增：PLE CGC配置 =====
+    num_shared_experts: int = 2  # 共享专家数量
+    num_task_experts: int = 1  # 每个任务的特定专家数量
+    num_cgc_layers: int = 3  # CGC层数量
     
     # 损失权重
     loss_weights: dict = None
