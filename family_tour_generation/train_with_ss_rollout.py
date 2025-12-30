@@ -467,7 +467,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_newple',
+        save_dir='../checkpoints_ss_with_condition_lessSS',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
