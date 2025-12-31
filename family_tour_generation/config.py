@@ -76,7 +76,7 @@ class TrainConfig:
     """训练配置"""
     batch_size: int = 32
     learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-4
     num_epochs: int = 100
     warmup_steps: int = 1000
     grad_clip: float = 1.0

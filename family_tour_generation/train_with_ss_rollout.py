@@ -23,7 +23,7 @@ from mtan_decoder import autoregressive_rollout
 from losses import compute_rollout_loss
 import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 sys.path.append('family_tour_generation')
 
@@ -72,7 +72,8 @@ class ScheduledSamplingTrainer:
         self.optimizer = optim.AdamW(
             model.parameters(),
             lr=train_config.learning_rate,
-            weight_decay=train_config.weight_decay
+            weight_decay=train_config.weight_decay,
+            betas=(0.9, 0.98)
         )
 
         # 学习率调度
@@ -366,12 +367,12 @@ def main():
         dropout=0.3,
         num_shared_experts=2,  # 可调整
         num_task_experts=2,  # 可调整
-        num_cgc_layers=3  # 可调整
+        num_cgc_layers=2  # 可调整
     )
 
     train_config = TrainConfig(
         batch_size=100,
-        learning_rate=1e-4,
+        learning_rate=5e-5,
         num_epochs=500
     )
 
@@ -467,7 +468,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_lessSS',
+        save_dir='../checkpoints_ss_with_condition_learning',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
