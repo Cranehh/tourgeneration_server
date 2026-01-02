@@ -223,8 +223,8 @@ def main():
     config = PatternExtractionConfig(
         max_family_size=8,
         max_activities=6,
-        person_n_components_range=(2, 250),
-        household_n_components_range=(2, 125),
+        person_n_components_range=(2, 40),
+        household_n_components_range=(2, 20),
         random_state=42
     )
     
@@ -323,15 +323,15 @@ def main():
     print("-" * 30)
     
     # 保存模型
-    extractor.save_model("gmm/activity_pattern_extractor.pkl")
+    extractor.save_model("gmm_lesscluster/activity_pattern_extractor.pkl")
     
     # 保存模式矩阵
-    np.save("gmm/family_patterns_demo.npy", family_patterns)
-    np.save("gmm/individual_patterns_demo.npy", individual_patterns)
+    np.save("gmm_lesscluster/family_patterns_demo.npy", family_patterns)
+    np.save("gmm_lesscluster/individual_patterns_demo.npy", individual_patterns)
     
     # 保存映射关系
     import json
-    with open("gmm/household_mapping_demo.json", "w", encoding='utf-8') as f:
+    with open("gmm_lesscluster/household_mapping_demo.json", "w", encoding='utf-8') as f:
         json.dump(household_mapping, f, ensure_ascii=False, indent=2)
     
     print("结果保存完成:")
