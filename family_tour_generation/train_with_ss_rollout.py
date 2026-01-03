@@ -371,7 +371,7 @@ def main():
     )
 
     train_config = TrainConfig(
-        batch_size=2,
+        batch_size=100,
         learning_rate=5e-5,
         num_epochs=500
     )
