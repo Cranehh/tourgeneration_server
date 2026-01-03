@@ -371,7 +371,7 @@ def main():
     )
 
     train_config = TrainConfig(
-        batch_size=100,
+        batch_size=2,
         learning_rate=5e-5,
         num_epochs=500
     )
@@ -468,7 +468,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_newgmmloss',
+        save_dir='../checkpoints_ss_with_condition_distance',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

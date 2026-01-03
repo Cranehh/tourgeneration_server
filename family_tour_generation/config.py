@@ -57,6 +57,9 @@ class ModelConfig:
     # 特殊zone ID
     zone_none: int = 2006  # 无效zone
     zone_padding: int = 2007  # padding
+
+    # ===== 新增：距离感知方式预测配置 =====
+    use_distance_aware_mode: bool = True  # 是否启用距离感知方式预测
     
     def __post_init__(self):
         if self.loss_weights is None:

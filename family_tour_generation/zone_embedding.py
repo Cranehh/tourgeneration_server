@@ -367,3 +367,61 @@ class ActivityZoneEmbedding(nn.Module):
         origin_embed = self.get_origin_embedding(origin_zones)
         dest_embed = self.get_destination_embedding(dest_zones)
         return origin_embed, dest_embed
+
+
+class DistanceAwareModeHead(nn.Module):
+    """
+    完全可学习的距离感知方式预测头
+    不显式分箱，让网络自己学习距离到方式的映射
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_modes: int = 11,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+
+        # 距离特征提取（多层MLP学习非线性映射）
+        self.distance_encoder = nn.Sequential(
+            nn.Linear(1, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, d_model // 4)
+        )
+
+        # 融合层
+        fusion_dim = d_model + d_model // 4
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_dim, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_modes)
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,    # (..., d_model)
+        distance: torch.Tensor   # (...) 标准化后的距离
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden: decoder输出的隐状态
+            distance: z-score标准化后的出行距离
+
+        Returns:
+            mode_logits: (..., num_modes)
+        """
+        # 距离编码
+        dist_feat = self.distance_encoder(distance.unsqueeze(-1))  # (..., d_model//4)
+
+        # 融合
+        fused = torch.cat([hidden, dist_feat], dim=-1)
+        mode_logits = self.fusion(fused)
+
+        return mode_logits

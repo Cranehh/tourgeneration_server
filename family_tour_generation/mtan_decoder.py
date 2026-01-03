@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 from config import ModelConfig
 from embedding import ActivityEmbedding, PositionalEncoding
+from zone_embedding import DistanceAwareModeHead  # 新增
 
 
 # ==================== 新增：模式条件模块 ====================
@@ -527,11 +528,21 @@ class OutputHeads(nn.Module):
             nn.Linear(config.d_model // 2, config.num_purposes)
         )
 
-        self.mode_head = nn.Sequential(
-            nn.Linear(input_dim, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.num_modes)
-        )
+        # ===== 修改：距离感知的方式预测头 =====
+        self.use_distance_aware_mode = getattr(config, 'use_distance_aware_mode', True) and self.use_destination
+
+        if self.use_distance_aware_mode:
+            self.mode_head = DistanceAwareModeHead(
+                d_model=input_dim,
+                num_modes=config.num_modes,
+                dropout=config.dropout
+            )
+        else:
+            self.mode_head = nn.Sequential(
+                nn.Linear(input_dim, config.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(config.d_model // 2, config.num_modes)
+            )
 
         self.driver_head = nn.Sequential(
             nn.Linear(input_dim, config.d_model // 2),
@@ -602,7 +613,6 @@ class OutputHeads(nn.Module):
         results = {
             'continuous': self.continuous_head(hidden),
             'purpose': self.purpose_head(hidden),
-            'mode': self.mode_head(hidden),
             'driver': self.driver_head(hidden),
             'joint': self.joint_head(hidden)
         }
@@ -615,6 +625,18 @@ class OutputHeads(nn.Module):
                 origin_zones=origin_zones
             )
             results['destination'] = dest_logits
+            # ===== 新增：计算距离并用于方式预测 =====
+            if self.use_distance_aware_mode:
+                # 获取预测的目的地
+                pred_destinations = dest_logits.argmax(dim=-1)  # (...)
+
+                # 计算出行距离
+                trip_distance = self._compute_trip_distance(origin_zones, pred_destinations)
+
+                # 用距离信息预测方式
+                results['mode'] = self.mode_head(hidden, trip_distance)
+            else:
+                results['mode'] = self.mode_head(hidden)
 
         return results
 
@@ -659,6 +681,34 @@ class OutputHeads(nn.Module):
         attn_scores = attn_scores + self.affordance_scale * affordance_scores
         f = torch.isnan(attn_scores).sum()
         return attn_scores  # 返回logits，不做softmax
+
+    def _compute_trip_distance(
+            self,
+            origin_zones: torch.Tensor,  # (...)
+            destination_zones: torch.Tensor  # (...)
+    ) -> torch.Tensor:
+        """
+        从阻抗矩阵查表获取OD距离
+
+        Args:
+            origin_zones: 出发地zone ID
+            destination_zones: 目的地zone ID
+
+        Returns:
+            distances: 出行距离
+        """
+        # 获取阻抗矩阵
+        impedance_matrix = self.zone_module.zone_impedance  # (num_zones, num_zones)
+
+        # 处理无效zone（clamp到有效范围）
+        num_zones = impedance_matrix.size(0)
+        valid_origin = origin_zones.clamp(0, num_zones - 1)
+        valid_dest = destination_zones.clamp(0, num_zones - 1)
+
+        # 查表获取距离
+        distances = impedance_matrix[valid_origin, valid_dest]
+
+        return distances
 
 
 class TimeConstraintModule(nn.Module):
