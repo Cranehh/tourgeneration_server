@@ -493,27 +493,46 @@ def compute_rollout_loss(
 # ==================== 新增：活动模式预测损失 ====================
 
 class PatternPredictionLoss(nn.Module):
-    """
-    活动模式预测损失
-
-    使用软交叉熵 + Label Smoothing，比 KL 散度更稳定
-    """
+    """使用Focal Loss的模式预测损失"""
 
     def __init__(
             self,
             family_weight: float = 1.0,
             individual_weight: float = 1.0,
-            label_smoothing: float = 0.1
+            focal_gamma: float = 2.0,  # 聚焦参数
+            label_smoothing: float = 0.05  # 轻微平滑
     ):
         super().__init__()
         self.family_weight = family_weight
         self.individual_weight = individual_weight
+        self.focal_gamma = focal_gamma
         self.label_smoothing = label_smoothing
 
     def _smooth_target(self, target: torch.Tensor) -> torch.Tensor:
-        """对目标分布做 Label Smoothing"""
         n_classes = target.size(-1)
         return (1 - self.label_smoothing) * target + self.label_smoothing / n_classes
+
+    def _focal_soft_ce(
+            self,
+            logits: torch.Tensor,
+            target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Focal Loss for soft labels
+
+        FL = -α * (1 - p_t)^γ * log(p_t)
+        对于软标签：FL = -Σ target_i * (1 - pred_i)^γ * log(pred_i)
+        """
+        log_pred = F.log_softmax(logits, dim=-1)
+        pred = torch.exp(log_pred)
+
+        # Focal weight: (1 - p)^gamma，让模型更关注预测错误的样本
+        focal_weight = (1 - pred) ** self.focal_gamma
+
+        # 软交叉熵 + focal weight
+        loss = -(target * focal_weight * log_pred).sum(dim=-1)
+
+        return loss
 
     def forward(
             self,
@@ -522,52 +541,29 @@ class PatternPredictionLoss(nn.Module):
             individual_pattern_target: torch.Tensor,
             member_mask: torch.BoolTensor = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Args:
-            pattern_outputs: 模型预测
-                - 'family_pattern_prob': (batch, num_family_patterns)
-                - 'individual_pattern_prob': (batch, max_members, num_individual_patterns)
-                - 或带 _logits 版本
-            family_pattern_target: (batch, num_family_patterns) GMM 目标分布
-            individual_pattern_target: (batch, max_members, num_individual_patterns)
-            member_mask: (batch, max_members) 有效成员掩码
 
-        Returns:
-            total_loss: scalar
-            loss_dict: 各部分损失
-        """
         losses = {}
 
-        # ========== 家庭模式损失: 软交叉熵 ==========
-        if 'family_pattern_logits' in pattern_outputs:
-            family_log_pred = F.log_softmax(pattern_outputs['family_pattern_logits'], dim=-1)
-        else:
-            # 从 prob 转换，先 clamp 防止 log(0)
-            family_prob = pattern_outputs['family_pattern_prob'].clamp(min=1e-8)
-            family_log_pred = F.log_softmax(family_prob.log(), dim=-1)
-
+        # 平滑目标
         smoothed_family = self._smooth_target(family_pattern_target)
-        family_loss = -(smoothed_family * family_log_pred).sum(dim=-1).mean()
+        smoothed_individual = self._smooth_target(individual_pattern_target)
+
+        # 家庭模式 Focal Loss
+        family_logits = pattern_outputs['family_pattern_logits']
+        family_loss = self._focal_soft_ce(family_logits, smoothed_family).mean()
         losses['family_pattern'] = family_loss
 
-        # ========== 个人模式损失: 软交叉熵 ==========
-        if 'individual_pattern_logits' in pattern_outputs:
-            individual_log_pred = F.log_softmax(pattern_outputs['individual_pattern_logits'], dim=-1)
-        else:
-            individual_prob = pattern_outputs['individual_pattern_prob'].clamp(min=1e-8)
-            individual_log_pred = F.log_softmax(individual_prob.log(), dim=-1)
-
-        smoothed_individual = self._smooth_target(individual_pattern_target)
-        ce = -(smoothed_individual * individual_log_pred).sum(dim=-1)  # (batch, max_members)
+        # 个人模式 Focal Loss
+        individual_logits = pattern_outputs['individual_pattern_logits']
+        individual_ce = self._focal_soft_ce(individual_logits, smoothed_individual)
 
         if member_mask is not None:
             num_valid = member_mask.sum().clamp(min=1)
-            individual_loss = (ce * member_mask.float()).sum() / num_valid
+            individual_loss = (individual_ce * member_mask.float()).sum() / num_valid
         else:
-            individual_loss = ce.mean()
+            individual_loss = individual_ce.mean()
         losses['individual_pattern'] = individual_loss
 
-        # 总损失
         total_loss = self.family_weight * family_loss + self.individual_weight * individual_loss
 
         return total_loss, losses
