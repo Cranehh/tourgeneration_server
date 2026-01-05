@@ -93,7 +93,7 @@ class PopulationDataEncoder:
         for col in self.activity_categorical_cols:
             ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
             # 处理缺失值
-            data_to_fit = activity_df[[col]].fillna('-1')
+            data_to_fit = activity_df[[col]].astype(int).fillna('-1')
             ohe.fit(data_to_fit)
             self.onehot_encoders[f'activity_{col}'] = ohe
             self.activity_categorical_dims.append(len(ohe.categories_[0]))
@@ -166,7 +166,7 @@ class PopulationDataEncoder:
         
         # 离散变量：one-hot编码
         for col in self.activity_categorical_cols:
-            data_to_encode = activity_df[[col]].fillna('unknown')
+            data_to_encode = activity_df[[col]].astype(int).fillna('-1')
             encoded = self.onehot_encoders[f'activity_{col}'].transform(data_to_encode)
             # encoded是二维数组，每行是一个样本的one-hot向量
             encoded_data[f'activity_{col}'] = encoded
