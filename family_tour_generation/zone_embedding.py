@@ -371,21 +371,35 @@ class ActivityZoneEmbedding(nn.Module):
 
 class DistanceAwareModeHead(nn.Module):
     """
-    完全可学习的距离感知方式预测头
-    不显式分箱，让网络自己学习距离到方式的映射
+    距离感知的方式预测头
+
+    改进：
+    1. 支持软加权期望距离
+    2. 引入距离-方式先验偏置（从数据统计初始化）
+    3. 多特征距离编码
     """
 
     def __init__(
-        self,
-        d_model: int,
-        num_modes: int = 11,
-        dropout: float = 0.1
+            self,
+            d_model: int,
+            num_modes: int = 11,
+            num_distance_bins: int = 10,
+            dropout: float = 0.1
     ):
         super().__init__()
+        self.num_modes = num_modes
+        self.num_distance_bins = num_distance_bins
 
-        # 距离特征提取（多层MLP学习非线性映射）
+        # 距离分箱边界（z-score标准化后）
+        self.register_buffer(
+            'distance_bins',
+            torch.linspace(-1.6, 4, num_distance_bins + 1)
+        )
+
+        # ===== 多特征距离编码 =====
+        # 输入：标量距离 + 分箱soft embedding
         self.distance_encoder = nn.Sequential(
-            nn.Linear(1, d_model // 4),
+            nn.Linear(1 + num_distance_bins, d_model // 4),
             nn.ReLU(),
             nn.Linear(d_model // 4, d_model // 4),
             nn.ReLU(),
@@ -404,10 +418,49 @@ class DistanceAwareModeHead(nn.Module):
             nn.Linear(d_model // 2, num_modes)
         )
 
+        # ===== 思路3：距离-方式先验偏置 =====
+        # 形状：(num_distance_bins, num_modes)
+        # 初始化为0，可以从数据统计后手动设置
+        self.distance_mode_prior = nn.Parameter(
+            torch.zeros(num_distance_bins, num_modes)
+        )
+
+        # 先验偏置的缩放系数（可学习）
+        self.prior_scale = nn.Parameter(torch.tensor(1.0))
+
+    def get_soft_bin_weights(self, distance: torch.Tensor) -> torch.Tensor:
+        """
+        计算距离属于每个bin的软权重（高斯核）
+
+        Args:
+            distance: (...) 标准化后的距离
+
+        Returns:
+            weights: (..., num_distance_bins) 软分箱权重
+        """
+        # 计算每个bin的中心
+        bin_centers = (self.distance_bins[:-1] + self.distance_bins[1:]) / 2  # (num_bins,)
+        bin_width = self.distance_bins[1] - self.distance_bins[0]
+
+        # 计算到每个中心的距离
+        dist_expanded = distance.unsqueeze(-1)  # (..., 1)
+        diff = (dist_expanded - bin_centers) / (bin_width / 2)  # (..., num_bins)
+
+        # 高斯核
+        weights = torch.exp(-0.5 * diff ** 2)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)  # 归一化
+
+        return weights
+
+    def get_distance_bin_index(self, distance: torch.Tensor) -> torch.Tensor:
+        """获取硬分箱索引"""
+        bin_idx = torch.bucketize(distance, self.distance_bins[1:-1])
+        return bin_idx.clamp(0, self.num_distance_bins - 1)
+
     def forward(
-        self,
-        hidden: torch.Tensor,    # (..., d_model)
-        distance: torch.Tensor   # (...) 标准化后的距离
+            self,
+            hidden: torch.Tensor,  # (..., d_model)
+            distance: torch.Tensor  # (...) 标准化后的距离
     ) -> torch.Tensor:
         """
         Args:
@@ -417,11 +470,45 @@ class DistanceAwareModeHead(nn.Module):
         Returns:
             mode_logits: (..., num_modes)
         """
-        # 距离编码
-        dist_feat = self.distance_encoder(distance.unsqueeze(-1))  # (..., d_model//4)
+        # ===== 多特征距离编码 =====
+        # 1. 标量距离
+        dist_scalar = distance.unsqueeze(-1)  # (..., 1)
 
-        # 融合
-        fused = torch.cat([hidden, dist_feat], dim=-1)
+        # 2. 软分箱权重
+        soft_bin_weights = self.get_soft_bin_weights(distance)  # (..., num_bins)
+
+        # 3. 拼接距离特征
+        dist_features = torch.cat([dist_scalar, soft_bin_weights], dim=-1)  # (..., 1+num_bins)
+        dist_encoded = self.distance_encoder(dist_features)  # (..., d_model//4)
+
+        # ===== 融合并预测 =====
+        fused = torch.cat([hidden, dist_encoded], dim=-1)
         mode_logits = self.fusion(fused)
 
+        # ===== 思路3：加入先验偏置 =====
+        # 用软分箱权重加权先验
+        # soft_bin_weights: (..., num_bins)
+        # distance_mode_prior: (num_bins, num_modes)
+        prior_bias = torch.einsum('...b,bm->...m', soft_bin_weights, self.distance_mode_prior)
+        mode_logits = mode_logits + self.prior_scale * prior_bias
+
         return mode_logits
+
+    def init_prior_from_data(self, distance_mode_counts: torch.Tensor):
+        """
+        从数据统计初始化先验偏置
+
+        Args:
+            distance_mode_counts: (num_distance_bins, num_modes)
+                                  每个距离区间各方式的出行次数
+        """
+        # 转换为log概率作为先验
+        counts = distance_mode_counts.float() + 1  # 平滑
+        probs = counts / counts.sum(dim=-1, keepdim=True)
+        log_probs = torch.log(probs)
+
+        # 减去均值，使其成为偏置
+        log_probs = log_probs - log_probs.mean(dim=-1, keepdim=True)
+
+        with torch.no_grad():
+            self.distance_mode_prior.copy_(log_probs)

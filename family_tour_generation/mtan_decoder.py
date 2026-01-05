@@ -576,7 +576,9 @@ class OutputHeads(nn.Module):
             hidden: torch.Tensor,
             family_pattern_prob: torch.Tensor = None,
             individual_pattern_prob: torch.Tensor = None,
-            origin_zones: torch.Tensor = None  # 新增参数: [...] 当前活动的origin
+            origin_zones: torch.Tensor = None,
+            target_destinations: torch.Tensor = None,  # ← 思路1：训练时传入真实目的地
+            gumbel_temperature: float = 1.0  # ← 思路2：Gumbel温度
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -584,57 +586,79 @@ class OutputHeads(nn.Module):
             family_pattern_prob: (B, num_family_patterns)
             individual_pattern_prob: (B, M, num_individual_patterns)
             origin_zones: (B, M) 或 (B, M, T) 当前活动的出发地zone ID
+            target_destinations: (B, M) 或 (B, M, T) 真实目的地（仅训练时使用）
+            gumbel_temperature: Gumbel-Softmax温度
         """
-        family_pattern_emb = self.family_pattern_proj(family_pattern_prob)  # (B, d_model)
+        # ===== 模式信息融合（保持原有逻辑）=====
+        family_pattern_emb = self.family_pattern_proj(family_pattern_prob)
         if hidden.dim() == 4:
-            family_pattern_emb = family_pattern_emb.unsqueeze(1).unsqueeze(2).expand(-1, hidden.size(1), hidden.size(2),
-                                                                                     -1)
+            family_pattern_emb = family_pattern_emb.unsqueeze(1).unsqueeze(2).expand(
+                -1, hidden.size(1), hidden.size(2), -1
+            )
         elif hidden.dim() == 3:
             family_pattern_emb = family_pattern_emb.unsqueeze(1).expand(-1, hidden.size(1), -1)
-        hidden = family_pattern_emb + hidden  # (*, d_model)
+        hidden = family_pattern_emb + hidden
         hidden = self.family_pattern_norm(hidden)
 
-        # 如果有模式信息，拼接到 hidden
-        # 投影模式信息
-        individual_pattern_emb = self.individual_pattern_proj(individual_pattern_prob)  # (B, M, d_model//4)
-
-        # 扩展到与 hidden 相同的维度
+        individual_pattern_emb = self.individual_pattern_proj(individual_pattern_prob)
         if hidden.dim() == 4:
-            # hidden: (B, M, T, d_model)
-            individual_pattern_emb = individual_pattern_emb.unsqueeze(2).expand(-1, -1, hidden.size(2), -1)
-        elif hidden.dim() == 3 and individual_pattern_emb.dim() == 3:
-            # hidden: (B, M, d_model), pattern_emb: (B, M, d_model//4)
-            pass  # 维度已匹配
-
-        # 拼接
-        hidden = individual_pattern_emb + hidden  # (*, d_model + d_model//4)
+            individual_pattern_emb = individual_pattern_emb.unsqueeze(2).expand(
+                -1, -1, hidden.size(2), -1
+            )
+        hidden = individual_pattern_emb + hidden
         hidden = self.individual_pattern_norm(hidden)
-        purpose_logits = self.purpose_head(hidden),
+
+        # ===== 基础预测 =====
+        purpose_logits = self.purpose_head(hidden)
+
         results = {
             'continuous': self.continuous_head(hidden),
-            'purpose': self.purpose_head(hidden),
+            'purpose': purpose_logits,
             'driver': self.driver_head(hidden),
             'joint': self.joint_head(hidden)
         }
 
-        # ===== 新增：目的地预测 =====
+        # ===== 目的地和方式预测 =====
         if self.use_destination and origin_zones is not None:
+            # 1. 预测目的地
             dest_logits = self._predict_destination(
                 hidden=hidden,
-                purpose_logits=purpose_logits[0],
+                purpose_logits=purpose_logits,
                 origin_zones=origin_zones
             )
             results['destination'] = dest_logits
-            # ===== 新增：计算距离并用于方式预测 =====
-            if self.use_distance_aware_mode:
-                # 获取预测的目的地
-                pred_destinations = dest_logits.argmax(dim=-1)  # (...)
 
-                # 计算出行距离
-                trip_distance = self._compute_trip_distance(origin_zones, pred_destinations)
+            # 2. 计算距离并预测方式
+            if self.use_distance_aware_mode:
+                # ===== 思路1：训练时用真实距离 =====
+                if self.training and target_destinations is not None:
+                    # 训练时：用真实目的地计算距离
+                    trip_distance = self._compute_trip_distance(origin_zones, target_destinations)
+                else:
+                    # ===== 思路2：推理时用Gumbel-Softmax期望距离 =====
+                    # 获取目的地概率分布
+                    dest_probs = self._gumbel_softmax(
+                        dest_logits,
+                        temperature=gumbel_temperature,
+                        hard=False  # 软概率，保持可导
+                    )
+
+                    # 计算期望距离
+                    trip_distance = self._compute_soft_distance(
+                        origin_zones,
+                        dest_probs,
+                        temperature=gumbel_temperature
+                    )
 
                 # 用距离信息预测方式
                 results['mode'] = self.mode_head(hidden, trip_distance)
+            else:
+                results['mode'] = self.mode_head(hidden)
+        else:
+            # 无目的地预测时
+            if self.use_distance_aware_mode:
+                dummy_distance = torch.zeros(hidden.shape[:-1], device=hidden.device)
+                results['mode'] = self.mode_head(hidden, dummy_distance)
             else:
                 results['mode'] = self.mode_head(hidden)
 
@@ -709,6 +733,70 @@ class OutputHeads(nn.Module):
         distances = impedance_matrix[valid_origin, valid_dest]
 
         return distances
+
+    def _compute_soft_distance(
+            self,
+            origin_zones: torch.Tensor,  # (...)
+            dest_probs: torch.Tensor,  # (..., num_zones) 目的地概率分布
+            temperature: float = 1.0
+    ) -> torch.Tensor:
+        """
+        思路2：计算期望距离（软加权）
+
+        distance = Σ P(dest=zone_i) × distance(origin, zone_i)
+
+        Args:
+            origin_zones: 出发地zone ID
+            dest_probs: 目的地的概率分布（经过softmax或gumbel-softmax）
+            temperature: Gumbel-Softmax温度
+
+        Returns:
+            expected_distance: 期望距离
+        """
+        # 获取阻抗矩阵
+        impedance_matrix = self.zone_module.zone_impedance  # (num_zones, num_zones)
+        num_zones = impedance_matrix.size(0)
+
+        # 处理origin
+        valid_origin = origin_zones.clamp(0, num_zones - 1)
+
+        # 获取从origin到所有zone的距离
+        # valid_origin: (...) -> 需要gather
+        origin_flat = valid_origin.reshape(-1)  # (N,)
+        distances_from_origin = impedance_matrix[origin_flat]  # (N, num_zones)
+
+        # 恢复形状
+        target_shape = list(origin_zones.shape) + [num_zones]
+        distances_from_origin = distances_from_origin.view(*target_shape)  # (..., num_zones)
+
+        # 期望距离 = Σ prob_i × distance_i
+        expected_distance = (dest_probs * distances_from_origin).sum(dim=-1)  # (...)
+
+        return expected_distance
+
+    def _gumbel_softmax(
+            self,
+            logits: torch.Tensor,
+            temperature: float = 1.0,
+            hard: bool = False
+    ) -> torch.Tensor:
+        """
+        Gumbel-Softmax: 可导的离散采样
+
+        Args:
+            logits: (..., num_classes) 未归一化的logits
+            temperature: 温度，越低越接近one-hot
+            hard: 是否使用straight-through estimator
+
+        Returns:
+            probs: (..., num_classes) 软概率或伪one-hot
+        """
+        if self.training:
+            # 训练时使用Gumbel-Softmax
+            return F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)
+        else:
+            # 推理时直接softmax
+            return F.softmax(logits / temperature, dim=-1)
 
 
 class TimeConstraintModule(nn.Module):
@@ -999,7 +1087,9 @@ class MTANDecoder(nn.Module):
             hidden=decoded,
             family_pattern_prob=pattern_outputs.get('family_pattern_prob') if pattern_outputs else None,
             individual_pattern_prob=pattern_outputs.get('individual_pattern_prob') if pattern_outputs else None,
-            origin_zones=origin_zones  # 新增
+            origin_zones=origin_zones,
+            target_destinations=target_destinations,  # ← 新增
+            gumbel_temperature=getattr(self.config, 'gumbel_temperature', 1.0)  # ← 新增
         )
         
         # 应用时间约束
@@ -1164,7 +1254,9 @@ class MTANDecoder(nn.Module):
             step_pred = self.output_heads(last_hidden,
                                         pattern_outputs['family_pattern_prob'],
                                         pattern_outputs['individual_pattern_prob'],
-                                        origin_zones=prev_destination
+                                        origin_zones=prev_destination,
+                                        target_destinations=None,  # ← 新增
+                                        gumbel_temperature=getattr(self.config, 'gumbel_temperature', 1.0)  # ← 新增
                                         )
 
 
@@ -1345,7 +1437,9 @@ def autoregressive_rollout(
             last_hidden,
             pattern_probs['family_pattern_prob'] if pattern_probs else None,
             pattern_probs['individual_pattern_prob'] if pattern_probs else None,
-            origin_zones=prev_destination  # ← 新增
+            origin_zones=prev_destination,
+            target_destinations=None,  # ← 新增
+            gumbel_temperature=getattr(decoder.config, 'gumbel_temperature', 1.0)  # ← 新增
         )
 
 

@@ -407,7 +407,9 @@ class ScheduledSamplingDecoder(nn.Module):
             step_pred = self.decoder.output_heads(last_hidden,
                                              pattern_outputs['family_pattern_prob'],
                                              pattern_outputs['individual_pattern_prob'],
-                                             origin_zones=current_origin
+                                             origin_zones=current_origin,
+                                             target_destinations=target_activities[:, :, t, -1].long() if self.training else None,  # ← 新增
+                                             gumbel_temperature=getattr(self.config, 'gumbel_temperature', 1.0) # ← 新增
                                              )
 
 

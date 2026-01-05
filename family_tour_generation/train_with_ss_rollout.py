@@ -378,6 +378,7 @@ def main():
 
     # 创建模型
     model = create_model(model_config)
+
     # ===== 新增：加载zone外部特征 =====
     if model_config.use_destination_prediction:
         data_dir = "../数据"
@@ -422,6 +423,42 @@ def main():
 
     individual_pattern_train = np.load(f'{data_dir}/person_pattern_train.npy')
     individual_pattern_test = np.load(f'{data_dir}/person_pattern_test.npy')
+
+    if model_config.use_distance_aware_mode:
+        # 需要预先统计：每个距离区间各方式的出行次数
+        # distance_mode_counts: (num_distance_bins, num_modes)
+        # 可以用以下代码从数据统计：
+        """
+        from collections import defaultdict
+        import numpy as np
+
+        num_bins = 10
+        num_modes = 11
+        bin_edges = np.linspace(-2.5, 2.5, num_bins + 1)
+
+        counts = np.zeros((num_bins, num_modes))
+
+        for batch in train_loader:
+            distances = ...  # 从batch提取距离
+            modes = ...      # 从batch提取方式
+
+            bin_indices = np.digitize(distances, bin_edges[1:-1])
+            for d_bin, mode in zip(bin_indices.flatten(), modes.flatten()):
+                if 0 <= d_bin < num_bins and 0 <= mode < num_modes:
+                    counts[d_bin, mode] += 1
+
+        np.save('distance_mode_counts.npy', counts)
+        """
+
+        # 如果已经有统计数据
+        try:
+            distance_mode_counts = np.load(f'{data_dir}/distance_mode_counts.npy')
+            model.decoder.output_heads.mode_head.init_prior_from_data(
+                torch.from_numpy(distance_mode_counts)
+            )
+            print("Distance-mode prior initialized from data.")
+        except FileNotFoundError:
+            print("No distance_mode_counts.npy found, using zero initialization.")
 
     train_dataset = FamilyTourDataset(
         family_data_train,
@@ -468,7 +505,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_distance',
+        save_dir='../checkpoints_ss_with_condition_betterdistance',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

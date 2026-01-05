@@ -60,6 +60,10 @@ class ModelConfig:
 
     # ===== 新增：距离感知方式预测配置 =====
     use_distance_aware_mode: bool = True  # 是否启用距离感知方式预测
+
+    # ===== 新增：Gumbel-Softmax 配置 =====
+    gumbel_temperature: float = 1.0  # Gumbel-Softmax 温度，训练时可逐渐降低
+    use_soft_distance: bool = True  # 是否使用期望距离（软加权）
     
     def __post_init__(self):
         if self.loss_weights is None:
