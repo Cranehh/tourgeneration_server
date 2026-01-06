@@ -590,23 +590,23 @@ class OutputHeads(nn.Module):
             gumbel_temperature: Gumbel-Softmax温度
         """
         # ===== 模式信息融合（保持原有逻辑）=====
-        family_pattern_emb = self.family_pattern_proj(family_pattern_prob)
-        if hidden.dim() == 4:
-            family_pattern_emb = family_pattern_emb.unsqueeze(1).unsqueeze(2).expand(
-                -1, hidden.size(1), hidden.size(2), -1
-            )
-        elif hidden.dim() == 3:
-            family_pattern_emb = family_pattern_emb.unsqueeze(1).expand(-1, hidden.size(1), -1)
-        hidden = family_pattern_emb + hidden
-        hidden = self.family_pattern_norm(hidden)
-
-        individual_pattern_emb = self.individual_pattern_proj(individual_pattern_prob)
-        if hidden.dim() == 4:
-            individual_pattern_emb = individual_pattern_emb.unsqueeze(2).expand(
-                -1, -1, hidden.size(2), -1
-            )
-        hidden = individual_pattern_emb + hidden
-        hidden = self.individual_pattern_norm(hidden)
+        # family_pattern_emb = self.family_pattern_proj(family_pattern_prob)
+        # if hidden.dim() == 4:
+        #     family_pattern_emb = family_pattern_emb.unsqueeze(1).unsqueeze(2).expand(
+        #         -1, hidden.size(1), hidden.size(2), -1
+        #     )
+        # elif hidden.dim() == 3:
+        #     family_pattern_emb = family_pattern_emb.unsqueeze(1).expand(-1, hidden.size(1), -1)
+        # hidden = family_pattern_emb + hidden
+        # hidden = self.family_pattern_norm(hidden)
+        #
+        # individual_pattern_emb = self.individual_pattern_proj(individual_pattern_prob)
+        # if hidden.dim() == 4:
+        #     individual_pattern_emb = individual_pattern_emb.unsqueeze(2).expand(
+        #         -1, -1, hidden.size(2), -1
+        #     )
+        # hidden = individual_pattern_emb + hidden
+        # hidden = self.individual_pattern_norm(hidden)
 
         # ===== 基础预测 =====
         purpose_logits = self.purpose_head(hidden)
@@ -1252,8 +1252,8 @@ class MTANDecoder(nn.Module):
 
             # 预测
             step_pred = self.output_heads(last_hidden,
-                                        pattern_outputs['family_pattern_prob'],
-                                        pattern_outputs['individual_pattern_prob'],
+                                        None,
+                                        None,
                                         origin_zones=prev_destination,
                                         target_destinations=None,  # ← 新增
                                         gumbel_temperature=getattr(self.config, 'gumbel_temperature', 1.0)  # ← 新增
