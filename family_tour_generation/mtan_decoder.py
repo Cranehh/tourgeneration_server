@@ -14,6 +14,77 @@ from config import ModelConfig
 from embedding import ActivityEmbedding, PositionalEncoding
 from zone_embedding import DistanceAwareModeHead  # 新增
 
+# ==================== 新增：属性交互注意力 ====================
+class CrossAttributeAttention(nn.Module):
+    """
+    属性间交叉注意力
+
+    每个属性生成query，可以attend到其他属性的representation
+    """
+
+    def __init__(self, d_model: int, num_attributes: int = 5, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_attributes = num_attributes
+
+        # 每个属性的独立投影（生成task-specific representation）
+        self.attr_projections = nn.ModuleList([
+            nn.Linear(d_model, d_model) for _ in range(num_attributes)
+        ])
+
+        # 跨属性注意力
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 融合层
+        self.fusion_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model)
+            ) for _ in range(num_attributes)
+        ])
+
+    def forward(self, hidden: torch.Tensor) -> list:
+        """
+        Args:
+            hidden: (..., d_model)
+
+        Returns:
+            list of enhanced features, one per attribute [..., d_model] x num_attributes
+        """
+        original_shape = hidden.shape[:-1]
+        batch_size = hidden.numel() // hidden.shape[-1]
+
+        # 1. 为每个属性生成task-specific representation
+        attr_repr = []
+        for proj in self.attr_projections:
+            repr_i = proj(hidden)
+            attr_repr.append(repr_i)
+
+        # 2. Stack成 (batch, num_attributes, d_model)
+        attr_stacked = torch.stack(attr_repr, dim=-2)  # (..., num_attr, d_model)
+        attr_flat = attr_stacked.reshape(batch_size, self.num_attributes, self.d_model)
+
+        # 3. 跨属性自注意力
+        attn_out, _ = self.cross_attn(attr_flat, attr_flat, attr_flat)
+        attn_out = attn_out.reshape(*original_shape, self.num_attributes, self.d_model)
+
+        # 4. 融合原始表示和注意力输出
+        enhanced_features = []
+        for i, fusion in enumerate(self.fusion_layers):
+            original_i = attr_repr[i]
+            attn_i = attn_out[..., i, :]
+            fused = fusion(torch.cat([original_i, attn_i], dim=-1))
+            enhanced_features.append(fused + original_i)  # 残差连接
+
+        return enhanced_features
 
 # ==================== 新增：模式条件模块 ====================
 
@@ -514,20 +585,80 @@ class OutputHeads(nn.Module):
         # 输入维度：d_model
         input_dim = config.d_model
 
-        # 连续属性回归头
-        self.continuous_head = nn.Sequential(
-            nn.Linear(input_dim, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.continuous_dim)
+        # ===== 新增：属性交叉注意力模块 =====
+        # 属性数量：purpose, mode, driver, joint, continuous, (destination)
+        num_attributes = 6 if self.use_destination else 5
+        self.cross_attribute_attention = CrossAttributeAttention(
+            d_model=input_dim,
+            num_attributes=num_attributes,
+            num_heads=4,
+            dropout=config.dropout
         )
+        self.use_cross_attention = getattr(config, 'use_cross_attribute_attention', True)  # 开关，可以通过config控制
 
-        # 离散属性分类头
-        self.purpose_head = nn.Sequential(
-            nn.Linear(input_dim, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.num_purposes)
-        )
+        # ===== 新增：统一输出配置 =====
+        self.use_unified_output = getattr(config, 'use_unified_output', True)
 
+        if self.use_unified_output:
+            # 输出维度定义（不含destination，因为destination单独处理）
+            self.output_dims = {
+                'purpose': config.num_purposes,  # 10
+                'mode': config.num_modes,  # 11
+                'driver': config.num_driver_status,  # 2
+                'joint': config.num_joint_status,  # 2
+                'continuous': config.continuous_dim  # 2
+            }
+            self.total_output_dim = sum(self.output_dims.values())  # 27
+
+            # 记录各属性在输出中的起止位置
+            self.output_slices = {}
+            start = 0
+            for name, dim in self.output_dims.items():
+                self.output_slices[name] = (start, start + dim)
+                start += dim
+
+            # 特征聚合器：将交叉注意力的多个输出融合
+            self.feature_aggregator = nn.Sequential(
+                nn.Linear(input_dim * num_attributes, input_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(input_dim * 2, input_dim),
+                nn.LayerNorm(input_dim)
+            )
+
+            # 统一输出网络
+            self.unified_output = nn.Sequential(
+                nn.Linear(input_dim, input_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(input_dim * 2, input_dim),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(input_dim, self.total_output_dim)
+            )
+        else:
+            # 保留原有的独立预测头
+            self.continuous_head = nn.Sequential(
+                nn.Linear(input_dim, config.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(config.d_model // 2, config.continuous_dim)
+            )
+            self.purpose_head = nn.Sequential(
+                nn.Linear(input_dim, config.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(config.d_model // 2, config.num_purposes)
+            )
+            self.driver_head = nn.Sequential(
+                nn.Linear(input_dim, config.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(config.d_model // 2, config.num_driver_status)
+            )
+            self.joint_head = nn.Sequential(
+                nn.Linear(input_dim, config.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(config.d_model // 2, config.num_joint_status)
+            )
+        self.mode_layer_norm = nn.LayerNorm(config.num_modes)
         # ===== 修改：距离感知的方式预测头 =====
         self.use_distance_aware_mode = getattr(config, 'use_distance_aware_mode', True) and self.use_destination
 
@@ -544,17 +675,6 @@ class OutputHeads(nn.Module):
                 nn.Linear(config.d_model // 2, config.num_modes)
             )
 
-        self.driver_head = nn.Sequential(
-            nn.Linear(input_dim, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.num_driver_status)
-        )
-
-        self.joint_head = nn.Sequential(
-            nn.Linear(input_dim, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.num_joint_status)
-        )
         # ===== 新增：目的地预测头 =====
         if self.use_destination:
             # Query投影（融合hidden + origin嵌入 + purpose信息）
@@ -608,59 +728,82 @@ class OutputHeads(nn.Module):
         # hidden = individual_pattern_emb + hidden
         # hidden = self.individual_pattern_norm(hidden)
 
-        # ===== 基础预测 =====
-        purpose_logits = self.purpose_head(hidden)
+        # ===== 2. 属性交叉注意力 =====
+        if self.use_cross_attention:
+            enhanced = self.cross_attribute_attention(hidden)
+        else:
+            num_attr = 6 if self.use_destination else 5
+            enhanced = [hidden] * num_attr
 
-        results = {
-            'continuous': self.continuous_head(hidden),
-            'purpose': purpose_logits,
-            'driver': self.driver_head(hidden),
-            'joint': self.joint_head(hidden)
-        }
+        if self.use_unified_output:
+            # 拼接所有属性特征
+            concat_features = torch.cat(enhanced, dim=-1)  # (..., d_model * num_attr)
 
-        # ===== 目的地和方式预测 =====
+            # 聚合
+            aggregated = self.feature_aggregator(concat_features)  # (..., d_model)
+
+            # 统一输出
+            all_logits = self.unified_output(aggregated)  # (..., total_output_dim)
+
+            # 分割得到各属性
+            results = self._split_logits(all_logits)
+        else:
+            # 使用独立预测头
+            if self.use_destination:
+                purpose_feat, mode_feat, driver_feat, joint_feat, cont_feat, dest_feat = enhanced
+            else:
+                purpose_feat, mode_feat, driver_feat, joint_feat, cont_feat = enhanced
+
+            results = {
+                'continuous': self.continuous_head(cont_feat),
+                'purpose': self.purpose_head(purpose_feat),
+                'driver': self.driver_head(driver_feat),
+                'joint': self.joint_head(joint_feat)
+            }
+            # mode单独处理（可能需要距离信息）
+            if not self.use_distance_aware_mode:
+                results['mode'] = self.mode_head(mode_feat)
+
+        # ===== 3. 目的地预测（单独处理）=====
+        dest_logits = None
         if self.use_destination and origin_zones is not None:
-            # 1. 预测目的地
+            # 用于目的地预测的特征
+            dest_feat = enhanced[-1] if self.use_cross_attention else hidden
+
             dest_logits = self._predict_destination(
-                hidden=hidden,
-                purpose_logits=purpose_logits,
+                hidden=dest_feat,
+                purpose_logits=results['purpose'],
                 origin_zones=origin_zones
             )
             results['destination'] = dest_logits
+        # ===== 目的地和方式预测 =====
 
-            # 2. 计算距离并预测方式
-            if self.use_distance_aware_mode:
-                # ===== 思路1：训练时用真实距离 =====
-                if self.training and target_destinations is not None:
-                    # 训练时：用真实目的地计算距离
-                    trip_distance = self._compute_trip_distance(origin_zones, target_destinations)
-                else:
-                    # ===== 思路2：推理时用Gumbel-Softmax期望距离 =====
-                    # 获取目的地概率分布
-                    dest_probs = self._gumbel_softmax(
-                        dest_logits,
-                        temperature=gumbel_temperature,
-                        hard=False  # 软概率，保持可导
-                    )
-
-                    # 计算期望距离
-                    trip_distance = self._compute_soft_distance(
-                        origin_zones,
-                        dest_probs,
-                        temperature=gumbel_temperature
-                    )
-
-                # 用距离信息预测方式
-                results['mode'] = self.mode_head(hidden, trip_distance)
+        # 2. 计算距离并预测方式
+        if self.use_distance_aware_mode:
+            # ===== 思路1：训练时用真实距离 =====
+            if self.training and target_destinations is not None:
+                # 训练时：用真实目的地计算距离
+                trip_distance = self._compute_trip_distance(origin_zones, target_destinations)
             else:
-                results['mode'] = self.mode_head(hidden)
+                # ===== 思路2：推理时用Gumbel-Softmax期望距离 =====
+                # 获取目的地概率分布
+                dest_probs = self._gumbel_softmax(
+                    dest_logits,
+                    temperature=gumbel_temperature,
+                    hard=False  # 软概率，保持可导
+                )
+
+                # 计算期望距离
+                trip_distance = self._compute_soft_distance(
+                    origin_zones,
+                    dest_probs,
+                    temperature=gumbel_temperature
+                )
+
+            # 用距离信息预测方式
+            results['mode'] = self.mode_layer_norm(self.mode_head(aggregated, trip_distance)+results['mode'])
         else:
-            # 无目的地预测时
-            if self.use_distance_aware_mode:
-                dummy_distance = torch.zeros(hidden.shape[:-1], device=hidden.device)
-                results['mode'] = self.mode_head(hidden, dummy_distance)
-            else:
-                results['mode'] = self.mode_head(hidden)
+            results['mode'] = self.mode_head(results['mode'])
 
         return results
 
@@ -676,34 +819,31 @@ class OutputHeads(nn.Module):
         """
         # 1. 获取origin的嵌入
         origin_embed = self.zone_module.get_zone_embedding(origin_zones)  # [..., zone_embed_dim]
-        a = torch.isnan(origin_embed).sum()
         # 2. 获取purpose概率
         purpose_probs = F.softmax(purpose_logits, dim=-1)  # [..., num_purposes]
 
         # 3. 构建Query（融合hidden + origin + purpose）
         query_input = torch.cat([hidden, origin_embed, purpose_probs], dim=-1)
         query = self.dest_query_proj(query_input)  # [..., d_model]
-        b= torch.isnan(query).sum()
 
         # 4. 获取所有zone的Key
         zone_keys = self.zone_module.get_all_zone_keys()  # [num_zones, d_model]
-        c1 = torch.isnan(zone_keys).sum()
         zone_keys = self.dest_key_proj(zone_keys)  # [num_zones, d_model]
-        c = torch.isnan(zone_keys).sum()
+
         # 5. 计算注意力分数
         # query: [..., d_model], zone_keys: [num_zones, d_model]
         d_k = query.size(-1)
         attn_scores = torch.einsum('...d,nd->...n', query, zone_keys) / (d_k ** 0.5)
         # attn_scores: [..., num_zones]
-        d = torch.isnan(attn_scores).sum()
+
         # 6. 添加空间阻抗偏置（距离越远，分数越低）
         impedance = self.zone_module.get_impedance(origin_zones)  # [..., num_zones]
         attn_scores = attn_scores - self.impedance_scale * impedance
-        e = torch.isnan(attn_scores).sum()
+
         # 7. 添加affordance偏置（活动类型匹配度）
         affordance_scores = self.zone_module.get_affordance_scores(purpose_probs)  # [..., num_zones]
         attn_scores = attn_scores + self.affordance_scale * affordance_scores
-        f = torch.isnan(attn_scores).sum()
+
         return attn_scores  # 返回logits，不做softmax
 
     def _compute_trip_distance(
@@ -797,6 +937,21 @@ class OutputHeads(nn.Module):
         else:
             # 推理时直接softmax
             return F.softmax(logits / temperature, dim=-1)
+
+    def _split_logits(self, all_logits: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        将统一输出分割为各属性的logits
+
+        Args:
+            all_logits: (..., total_output_dim)
+
+        Returns:
+            dict of {attr_name: (..., attr_dim)}
+        """
+        results = {}
+        for name, (start, end) in self.output_slices.items():
+            results[name] = all_logits[..., start:end]
+        return results
 
 
 class TimeConstraintModule(nn.Module):

@@ -64,6 +64,10 @@ class ModelConfig:
     # ===== 新增：Gumbel-Softmax 配置 =====
     gumbel_temperature: float = 1.0  # Gumbel-Softmax 温度，训练时可逐渐降低
     use_soft_distance: bool = True  # 是否使用期望距离（软加权）
+
+    # ===== 新增：统一输出配置 =====
+    use_unified_output: bool = True
+    use_cross_attribute_attention: bool = True
     
     def __post_init__(self):
         if self.loss_weights is None:
