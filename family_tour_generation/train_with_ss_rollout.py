@@ -13,7 +13,7 @@ from tqdm import tqdm
 from config import ModelConfig, TrainConfig
 from data import FamilyTourBatch, FamilyTourDataset, collate_fn
 from model import create_model
-from losses import FamilyTourLoss, MetricsCalculator
+from losses import FamilyTourLoss, MetricsCalculator, cagrad_backward, cagrad_backward_amp
 from exposure_bias import (
     ExposureBiasTrainer,
     ScheduledSamplingScheduler,
@@ -23,7 +23,7 @@ from mtan_decoder import autoregressive_rollout
 from losses import compute_rollout_loss
 import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 sys.path.append('family_tour_generation')
 
@@ -115,7 +115,7 @@ class ScheduledSamplingTrainer:
                         batch, self.criterion, self.optimizer, self.current_epoch
                     )
 
-                self.scaler.scale(loss).backward()
+                cagrad_backward_amp(self.model, loss, losses, self.scaler, c=1)
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.train_config.grad_clip
@@ -126,7 +126,7 @@ class ScheduledSamplingTrainer:
                 loss, losses = self.eb_trainer.train_step(
                     batch, self.criterion, self.optimizer, self.current_epoch
                 )
-                loss.backward()
+                cagrad_backward(self.model, loss, losses, c=1)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.train_config.grad_clip
                 )
@@ -505,7 +505,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_non_pattern',
+        save_dir='../checkpoints_ss_with_condition_cgrad',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

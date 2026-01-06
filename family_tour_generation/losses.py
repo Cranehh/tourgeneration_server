@@ -569,5 +569,179 @@ class PatternPredictionLoss(nn.Module):
         return total_loss, losses
 
 # ==================== 新增结束 ====================
+# ==================== CAGrad 梯度调整 ====================
 
-# ==================== 新增结束 ====================
+import numpy as np
+from scipy.optimize import minimize
+
+
+def cagrad_backward(
+        model: torch.nn.Module,
+        loss: torch.Tensor,
+        losses: Dict[str, torch.Tensor],
+        c: float = 0.5
+) -> None:
+    """
+    使用 CAGrad 进行反向传播（替换原来的 loss.backward()）
+
+    Args:
+        model: 模型
+        loss: 总损失（用于 decoder 的普通梯度）
+        losses: 各任务损失字典
+        c: CAGrad 约束半径 (推荐 0.4-0.6)
+
+    使用示例:
+        loss, losses = criterion(predictions, targets, ...)
+        # loss.backward()  ← 删掉这行
+        cagrad_backward(model, loss, losses, c=0.5)  # ← 用这个替换
+        optimizer.step()
+    """
+    # 获取 encoder 参数
+    # if hasattr(model, 'encoder'):
+    #     shared_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    # else:
+    shared_params = [p for p in model.parameters() if p.requires_grad]
+
+    # 计算每个任务对 encoder 的梯度
+    task_grads = []
+    task_names = list(losses.keys())
+    num_tasks = len(task_names)
+
+    for i, (name, task_loss) in enumerate(losses.items()):
+        grads = torch.autograd.grad(
+            task_loss,
+            shared_params,
+            retain_graph=True,  # 保留计算图
+            allow_unused=True
+        )
+        grad_vec = torch.cat([
+            g.view(-1) if g is not None else torch.zeros(p.numel(), device=task_loss.device)
+            for g, p in zip(grads, shared_params)
+        ])
+        task_grads.append(grad_vec)
+
+    # 堆叠为矩阵 (num_tasks, grad_dim)
+    grads_matrix = torch.stack(task_grads, dim=0)
+
+    # 应用 CAGrad 算法
+    cagrad_vec = _cagrad_core(grads_matrix, c)
+
+    # 写回 encoder 梯度
+    offset = 0
+    for p in shared_params:
+        numel = p.numel()
+        p.grad = cagrad_vec[offset:offset + numel].view_as(p).clone()
+        offset += numel
+
+    # 对 decoder 用普通 backward（最后一次，不需要 retain_graph）
+    if hasattr(model, 'decoder'):
+        decoder_params = [p for p in model.decoder.parameters() if p.requires_grad]
+        decoder_grads = torch.autograd.grad(
+            loss,
+            decoder_params,
+            allow_unused=True
+        )
+        for p, g in zip(decoder_params, decoder_grads):
+            if g is not None:
+                p.grad = g
+
+
+def _cagrad_core(grads: torch.Tensor, c: float = 0.5) -> torch.Tensor:
+    """CAGrad 核心算法"""
+    num_tasks = grads.shape[0]
+    g0 = grads.mean(dim=0)
+    g0_norm = g0.norm()
+
+    if g0_norm < 1e-8:
+        return g0
+
+    GG = grads @ grads.T
+    x_init = np.ones(num_tasks) / num_tasks
+    bnds = tuple((0, 1) for _ in range(num_tasks))
+    cons = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+
+    A = GG.detach().cpu().numpy()
+    b = (grads @ g0).detach().cpu().numpy()
+
+    def obj(x):
+        return x @ A @ x - 2 * x @ b
+
+    result = minimize(obj, x_init, method='SLSQP', bounds=bnds,
+                      constraints=cons, options={'maxiter': 100, 'ftol': 1e-8})
+
+    w = torch.tensor(result.x, dtype=grads.dtype, device=grads.device)
+    g_w = w @ grads
+
+    diff = g_w - g0
+    diff_norm = diff.norm()
+
+    if diff_norm > 1e-8:
+        cagrad_vec = g0 + c * g0_norm * diff / diff_norm
+    else:
+        cagrad_vec = g0
+
+    # 缩放到原始范数
+    cagrad_vec = cagrad_vec * g0_norm / (cagrad_vec.norm() + 1e-8)
+
+    return cagrad_vec
+
+
+def cagrad_backward_amp(
+        model: torch.nn.Module,
+        loss: torch.Tensor,
+        losses: Dict[str, torch.Tensor],
+        scaler: torch.cuda.amp.GradScaler,
+        c: float = 0.5
+) -> None:
+    """
+    AMP 混合精度版本的 CAGrad 反向传播
+    """
+    # 获取 encoder 参数
+    # if hasattr(model, 'encoder'):
+    #     shared_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    # else:
+    shared_params = [p for p in model.parameters() if p.requires_grad]
+
+    # 计算每个任务对 encoder 的梯度
+    task_grads = []
+
+    for i, (name, task_loss) in enumerate(losses.items()):
+        # 对每个任务损失进行 scale
+        scaled_loss = scaler.scale(task_loss)
+        grads = torch.autograd.grad(
+            scaled_loss,
+            shared_params,
+            retain_graph=True,
+            allow_unused=True
+        )
+        grad_vec = torch.cat([
+            g.view(-1) if g is not None else torch.zeros(p.numel(), device=task_loss.device)
+            for g, p in zip(grads, shared_params)
+        ])
+        task_grads.append(grad_vec)
+
+    # 堆叠为矩阵
+    grads_matrix = torch.stack(task_grads, dim=0)
+
+    # 应用 CAGrad 算法
+    cagrad_vec = _cagrad_core(grads_matrix, c)
+
+    # 写回 encoder 梯度
+    offset = 0
+    for p in shared_params:
+        numel = p.numel()
+        p.grad = cagrad_vec[offset:offset + numel].view_as(p).clone()
+        offset += numel
+
+    # 对 decoder 用普通 backward
+    if hasattr(model, 'decoder'):
+        decoder_params = [p for p in model.decoder.parameters() if p.requires_grad]
+        scaled_loss = scaler.scale(loss)
+        decoder_grads = torch.autograd.grad(
+            scaled_loss,
+            decoder_params,
+            allow_unused=True
+        )
+        for p, g in zip(decoder_params, decoder_grads):
+            if g is not None:
+                p.grad = g
