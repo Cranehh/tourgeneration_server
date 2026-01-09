@@ -405,8 +405,8 @@ class ScheduledSamplingDecoder(nn.Module):
 
             # 预测
             step_pred = self.decoder.output_heads(last_hidden,
-                                             None,
-                                             None,
+                                             pattern_outputs['family_pattern_prob'],
+                                             pattern_outputs['individual_pattern_prob'],
                                              origin_zones=current_origin,
                                              target_destinations=target_activities[:, :, t, -1].long() if self.training else None,  # ← 新增
                                              gumbel_temperature=getattr(self.config, 'gumbel_temperature', 1.0) # ← 新增
@@ -622,10 +622,10 @@ class ExposureBiasTrainer:
             home_zones=batch.home_zones,
             target_destinations=batch.target_destinations
         )
-        # pattern_prob.update({
-        #     'family_pattern_target': batch.family_pattern,
-        #     'individual_pattern_target': batch.member_pattern,
-        # })
+        pattern_prob.update({
+            'family_pattern_target': batch.family_pattern,
+            'individual_pattern_target': batch.member_pattern,
+        })
         # 计算损失
         loss, losses = criterion(
             predictions, batch.activities,
