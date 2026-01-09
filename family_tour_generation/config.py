@@ -45,7 +45,7 @@ class ModelConfig:
     loss_weights: dict = None
 
     # 使用模式专家
-    use_pattern_condition = False
+    use_pattern_condition = True
 
     # ===== 新增：目的地预测配置 =====
     use_destination_prediction: bool = True
