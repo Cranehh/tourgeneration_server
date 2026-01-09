@@ -43,6 +43,7 @@ class ModelConfig:
     
     # 损失权重
     loss_weights: dict = None
+    use_uncertainty_weight = True
 
     # 使用模式专家
     use_pattern_condition = True

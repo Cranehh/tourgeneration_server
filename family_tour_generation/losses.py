@@ -114,6 +114,12 @@ class FamilyTourLoss(nn.Module):
         # 新增: 模式预测损失
         self.pattern_loss = None
         self.pattern_loss_weights = self.weights.get('pattern', 0.5)
+
+        # 添加不确定性权重
+        self.use_uw = model_config.use_uncertainty_weight
+        if self.use_uw:
+            num_tasks = len(self.weights)
+            self.log_vars = nn.Parameter(torch.zeros(num_tasks))
     
     def forward(
         self,
@@ -221,7 +227,15 @@ class FamilyTourLoss(nn.Module):
                 focal_gamma= self.train_config.focal_gamma
             )
             losses['destination'] = dest_loss
-            total_loss = total_loss + self.weights.get('destination', 1)
+            total_loss = total_loss + self.weights.get('destination', 1) * dest_loss
+
+        if self.use_uw:
+            total_loss = 0
+            for i, (name, loss) in enumerate(losses.items()):
+                precision = torch.exp(-self.log_vars[i])
+                total_loss += precision * loss + 0.5 * self.log_vars[i]
+        else:
+            total_loss = sum(self.weights[k] * v for k, v in losses.items())
 
         return total_loss, losses
     

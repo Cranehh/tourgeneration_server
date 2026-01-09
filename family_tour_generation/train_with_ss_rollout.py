@@ -23,7 +23,7 @@ from mtan_decoder import autoregressive_rollout
 from losses import compute_rollout_loss
 import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 sys.path.append('family_tour_generation')
 
@@ -505,7 +505,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_recoverpattern',
+        save_dir='../checkpoints_ss_with_condition_uncertainty',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
