@@ -190,7 +190,7 @@ class FamilyTourLoss(nn.Module):
         total_loss = sum(self.weights[k] * v for k, v in losses.items())
 
         # 新增: 模式预测损失
-        if pattern_outputs is not None:
+        if pattern_outputs is not None and self.model_config.use_pattern_condition:
             if self.pattern_loss is None:
                 self.pattern_loss = PatternPredictionLoss()
 
@@ -221,7 +221,7 @@ class FamilyTourLoss(nn.Module):
                 focal_gamma= self.train_config.focal_gamma
             )
             losses['destination'] = dest_loss
-            total_loss = total_loss + self.weights.get('destination', 1)
+            total_loss = total_loss + self.weights.get('destination', 1) * dest_loss
 
         return total_loss, losses
     

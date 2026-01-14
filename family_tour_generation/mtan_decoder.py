@@ -888,7 +888,7 @@ class MTANDecoder(nn.Module):
         self.cross_role_attention = CrossRoleAttention(config)
 
         # Transformer Decoder层（带模式条件）
-        self.use_pattern_conditioned_decoder = getattr(config, 'use_pattern_condition', True)
+        self.use_pattern_conditioned_decoder = getattr(config, 'use_pattern_condition_in_decoder', True)
 
         if self.use_pattern_conditioned_decoder:
             self.transformer_decoder = PatternConditionedDecoder(

@@ -2,6 +2,10 @@
 完整的家庭活动链生成模型
 整合: PLE编码器 + MTAN Decoder
 """
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, Any
@@ -12,6 +16,8 @@ from config import ModelConfig
 from ple_encoder import PLEEncoder
 from mtan_decoder import MTANDecoder
 from data import FamilyTourBatch
+from integration import IntegratedPatternPredictor, PatternConditionInjector
+
 
 
 class FamilyTourGenerator(nn.Module):
@@ -49,6 +55,12 @@ class FamilyTourGenerator(nn.Module):
             num_cgc_layers=getattr(config, 'num_cgc_layers', 3)
         )
 
+        self.pattern_predictor = IntegratedPatternPredictor(
+            student_checkpoint_path="./checkpoints_student/best_student.pt",
+            target_d_model=config.d_model,  # 主模型的d_model
+            freeze_student=True   # 建议先冻结，后期可以解冻微调
+        )
+        
         # MTAN Decoder
 
         self.decoder = MTANDecoder(config)
