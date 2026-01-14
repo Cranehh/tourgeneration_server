@@ -196,7 +196,7 @@ class FamilyTourLoss(nn.Module):
         total_loss = sum(self.weights[k] * v for k, v in losses.items())
 
         # 新增: 模式预测损失
-        if pattern_outputs is not None:
+        if pattern_outputs is not None and self.model_config.use_pattern_condition:
             if self.pattern_loss is None:
                 self.pattern_loss = PatternPredictionLoss()
 
@@ -228,14 +228,6 @@ class FamilyTourLoss(nn.Module):
             )
             losses['destination'] = dest_loss
             total_loss = total_loss + self.weights.get('destination', 1) * dest_loss
-
-        if self.use_uw:
-            total_loss = 0
-            for i, (name, loss) in enumerate(losses.items()):
-                precision = torch.exp(-self.log_vars[i])
-                total_loss += precision * loss + 0.5 * self.log_vars[i]
-        else:
-            total_loss = sum(self.weights[k] * v for k, v in losses.items())
 
         return total_loss, losses
     

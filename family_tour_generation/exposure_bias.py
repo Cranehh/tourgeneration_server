@@ -18,6 +18,7 @@ from mtan_decoder import autoregressive_rollout
 from losses import compute_rollout_loss
 
 
+
 class ScheduledSamplingScheduler:
     """
     Scheduled Sampling 调度器
@@ -613,6 +614,14 @@ class ExposureBiasTrainer:
             batch.family_attr, batch.member_attr, batch.member_mask, batch.home_zones, batch.work_positions
         )
         
+        # 在主模型中使用
+        member_attr_padded = F.pad(batch.member_attr, (0, 1))
+        outputs = self.model.pattern_predictor(batch.family_attr, member_attr_padded, batch.member_mask)
+        pattern_prob = {}
+        # 获取模式概率分布（可选，用于监督）
+        pattern_prob['family_pattern_prob'] = outputs['family_pattern_prob']  # [B, 20]
+        pattern_prob['individual_pattern_prob'] = outputs['person_pattern_prob']  # [B, M, 40]
+
         # 解码 (使用 Scheduled Sampling)
         predictions = self.ss_decoder(
             member_repr, family_repr, batch.activities,
