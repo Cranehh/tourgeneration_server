@@ -92,6 +92,14 @@ class FamilyTourGenerator(nn.Module):
             batch.home_zones,
             batch.work_positions
         )
+
+        # 在主模型中使用
+        member_attr_padded = F.pad(batch.member_attr, (0, 1))
+        outputs = self.model.pattern_predictor(batch.family_attr, member_attr_padded, batch.member_mask)
+        pattern_probs = {}
+        # 获取模式概率分布（可选，用于监督）
+        pattern_probs['family_pattern_prob'] = outputs['family_pattern_prob']  # [B, 20]
+        pattern_probs['individual_pattern_prob'] = outputs['person_pattern_prob']  # [B, M, 40]
         
         if teacher_forcing:
             # 训练模式: teacher forcing
