@@ -11,7 +11,7 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, Any
 
 from torch import Tensor
-
+import torch.nn.functional as F
 from config import ModelConfig
 from ple_encoder import PLEEncoder
 from mtan_decoder import MTANDecoder
@@ -141,6 +141,13 @@ class FamilyTourGenerator(nn.Module):
         member_repr, family_repr, pattern_prob = self.encoder(
             family_attr, member_attr, member_mask, home_zones, work_positions
         )
+
+        member_attr_padded = F.pad(member_attr, (0, 1))
+        outputs = self.pattern_predictor(family_attr, member_attr_padded, member_mask)
+        pattern_prob = {}
+        # 获取模式概率分布（可选，用于监督）
+        pattern_prob['family_pattern_prob'] = outputs['family_pattern_prob']  # [B, 20]
+        pattern_prob['individual_pattern_prob'] = outputs['person_pattern_prob']  # [B, M, 40]
         
         # 自回归生成
         return self.decoder.generate(

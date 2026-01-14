@@ -176,19 +176,19 @@ class ScheduledSamplingTrainer:
             predictions, pattern_probs = self.model.generate(
                 batch.family_attr, batch.member_attr, batch.member_mask, home_zones=batch.home_zones, work_positions=batch.work_positions
             )
-            pattern_probs.update({
-                'family_pattern_target': batch.family_pattern,
-                'individual_pattern_target': batch.member_pattern,
-            })
+            # pattern_probs.update({
+            #     'family_pattern_target': batch.family_pattern,
+            #     'individual_pattern_target': batch.member_pattern,
+            # })
 
             # 调整预测格式以计算损失
             # generate 返回的 purpose, mode 等是索引，需要转换为 logits 格式
             # 这里简化处理，用 teacher forcing 计算损失
             predictions_tf, pattern_probs_tf = self.model(batch, teacher_forcing=True)
-            pattern_probs_tf.update({
-                'family_pattern_target': batch.family_pattern,
-                'individual_pattern_target': batch.member_pattern,
-            })
+            # pattern_probs_tf.update({
+            #     'family_pattern_target': batch.family_pattern,
+            #     'individual_pattern_target': batch.member_pattern,
+            # })
             loss_tf, losses_tf = self.criterion(
                 predictions_tf, batch.activities,
                 batch.member_mask, batch.activity_mask,
