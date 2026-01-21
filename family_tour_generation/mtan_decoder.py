@@ -528,6 +528,13 @@ class OutputHeads(nn.Module):
             nn.Linear(config.d_model // 2, config.num_purposes)
         )
 
+        # 在 MTAN decoder 的 output_heads 中添加:
+        self.end_head = nn.Sequential(
+            nn.Linear(input_dim, config.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(config.d_model // 2, 2)
+        )
+
         # ===== 修改：距离感知的方式预测头 =====
         self.use_distance_aware_mode = getattr(config, 'use_distance_aware_mode', True) and self.use_destination
 
@@ -615,7 +622,8 @@ class OutputHeads(nn.Module):
             'continuous': self.continuous_head(hidden),
             'purpose': purpose_logits,
             'driver': self.driver_head(hidden),
-            'joint': self.joint_head(hidden)
+            'joint': self.joint_head(hidden),
+            'end': self.end_head(hidden)
         }
 
         # ===== 目的地和方式预测 =====
@@ -1178,6 +1186,7 @@ class MTANDecoder(nn.Module):
         generated_mode = []
         generated_driver = []
         generated_joint = []
+        generated_end = []
         # 初始化
         if self.use_destination and home_zones is not None:
             prev_destination = home_zones.unsqueeze(1).expand(-1, max_members)  # [B, M]
@@ -1282,6 +1291,7 @@ class MTANDecoder(nn.Module):
             generated_mode.append(step_pred['mode'])
             generated_driver.append(step_pred['driver'])
             generated_joint.append(step_pred['joint'])
+            generated_end.append(step_pred['end'])
             
             # 更新prev_continuous
             prev_continuous = constrained_continuous
@@ -1312,7 +1322,8 @@ class MTANDecoder(nn.Module):
             'purpose': torch.stack(generated_purpose, dim=2),
             'mode': torch.stack(generated_mode, dim=2),
             'driver': torch.stack(generated_driver, dim=2),
-            'joint': torch.stack(generated_joint, dim=2)
+            'joint': torch.stack(generated_joint, dim=2),
+            'end': torch.stack(generated_end, dim=2)
         }
 
         if generated_destination:
@@ -1388,7 +1399,8 @@ def autoregressive_rollout(
         prev_destination = None
 
     # Rollout
-    rollout_preds = {'continuous': [], 'purpose': [], 'mode': [], 'driver': [], 'joint': [],'destination': []}
+    rollout_preds = {'continuous': [], 'purpose': [], 'mode': [], 'driver': [], 'joint': [],'destination': [],
+                     'end': []}
 
     for t in range(rollout_length):
         seq_len = current_input.size(2)
@@ -1456,6 +1468,7 @@ def autoregressive_rollout(
         rollout_preds['mode'].append(step_pred['mode'])
         rollout_preds['driver'].append(step_pred['driver'])
         rollout_preds['joint'].append(step_pred['joint'])
+        rollout_preds['end'].append(step_pred['end'])
 
         # 构建下一步输入（用预测而非真实标签）
         next_emb = decoder.activity_embedding.embed_from_indices(
@@ -1481,7 +1494,8 @@ def autoregressive_rollout(
         'purpose': torch.stack(rollout_preds['purpose'], dim=2),
         'mode': torch.stack(rollout_preds['mode'], dim=2),
         'driver': torch.stack(rollout_preds['driver'], dim=2),
-        'joint': torch.stack(rollout_preds['joint'], dim=2)
+        'joint': torch.stack(rollout_preds['joint'], dim=2),
+        'end': torch.stack(rollout_preds['end'], dim=2)
     }
     if rollout_preds['destination']:
         results['destination'] = torch.stack(rollout_preds['destination'], dim=2)

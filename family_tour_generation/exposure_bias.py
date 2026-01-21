@@ -329,7 +329,8 @@ class ScheduledSamplingDecoder(nn.Module):
             'mode': [],
             'driver': [],
             'joint': [],
-            'destination': []  # 新增
+            'destination': [],  # 新增
+            'end': []
         }
         
         # 准备任务特定注意力和 Cross-Role 注意力
@@ -435,6 +436,7 @@ class ScheduledSamplingDecoder(nn.Module):
             all_predictions['mode'].append(step_pred['mode'])
             all_predictions['driver'].append(step_pred['driver'])
             all_predictions['joint'].append(step_pred['joint'])
+            all_predictions['end'].append(step_pred['end'])
             if 'destination' in step_pred:
                 all_predictions['destination'].append(step_pred['destination'])
             
@@ -506,7 +508,8 @@ class ScheduledSamplingDecoder(nn.Module):
             'mode': torch.stack(all_predictions['mode'], dim=2),
             'driver': torch.stack(all_predictions['driver'], dim=2),
             'joint': torch.stack(all_predictions['joint'], dim=2),
-            'destination': torch.stack(all_predictions['destination'], dim=2) if all_predictions['destination'] else None
+            'destination': torch.stack(all_predictions['destination'], dim=2) if all_predictions['destination'] else None,
+            'end': torch.stack(all_predictions['end'], dim=2)
         }
     
     def _construct_activity_tensor(
@@ -638,7 +641,7 @@ class ExposureBiasTrainer:
         # 计算损失
         loss, losses = criterion(
             predictions, batch.activities,
-            batch.member_mask, batch.activity_mask, pattern_prob
+            batch.member_mask, batch.activity_mask, pattern_prob, batch.home_zones
         )
 
         ar_stage = {1:{'prob': 0.3, 'length':2, 'ar_ratio':0.3},

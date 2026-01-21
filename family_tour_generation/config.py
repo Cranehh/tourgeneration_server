@@ -65,6 +65,9 @@ class ModelConfig:
     # ===== 新增：Gumbel-Softmax 配置 =====
     gumbel_temperature: float = 1.0  # Gumbel-Softmax 温度，训练时可逐渐降低
     use_soft_distance: bool = True  # 是否使用期望距离（软加权）
+
+
+
     
     def __post_init__(self):
         if self.loss_weights is None:
@@ -75,7 +78,11 @@ class ModelConfig:
                 'driver': 1,
                 'joint': 1,
                 'pattern': 0.2,
-                'destination': 1.0  # 新增
+                'destination': 1.0,  # 新增\
+                'coord_joint_consistency': 0.5,
+                'coord_vehicle_constraint': 0.5,
+                'coord_home_constraint': 0.5,
+                'end_token': 1.0
             }
 
 
@@ -95,3 +102,9 @@ class TrainConfig:
 
     # 设备
     device: str = 'cuda'
+    # ===== 新增：联合活动损失 =====
+    lambda_joint: float = 1.0
+    lambda_vehicle: float = 2.0
+    lambda_home: float = 1.0
+    use_coordination_loss: bool = True
+    coordination_weight: float = 0.5

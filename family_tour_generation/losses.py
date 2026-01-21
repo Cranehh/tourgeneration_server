@@ -8,6 +8,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple
 from config import ModelConfig, TrainConfig
+from coordination_loss import FamilyCoordinationLoss
+
+
+def end_token_loss(
+        end_logits: torch.Tensor,  # (B, M, A, 2) 是否结束的logits
+        activity_mask: torch.BoolTensor,
+        member_mask: torch.BoolTensor,
+        focal_gamma: float = 2.0,
+) -> torch.Tensor:
+    """
+    在decoder中增加一个 end_token 预测头，显式学习何时停止
+
+    target: 最后一个有效活动位置为1，其余为0
+    """
+    batch_size, max_members, max_activities = activity_mask.shape
+    device = activity_mask.device
+
+    # 构造target: 只有最后一个有效位置为1
+    real_lengths = activity_mask.sum(dim=-1)  # (B, M)
+    target = torch.zeros_like(activity_mask, dtype=torch.long)  # (B, M, A)
+
+    for b in range(batch_size):
+        for m in range(max_members):
+            if member_mask[b, m] and real_lengths[b, m] > 0:
+                last_idx = real_lengths[b, m].long() - 1
+                target[b, m, last_idx] = 1
+
+    # Focal Loss
+    valid_mask = member_mask.unsqueeze(-1) & activity_mask
+    logits_flat = end_logits[valid_mask].view(-1, 2)
+    target_flat = target[valid_mask].view(-1)
+
+    ce = F.cross_entropy(logits_flat, target_flat, reduction='none')
+    pt = torch.exp(-ce)
+    focal = ((1 - pt) ** focal_gamma * ce).mean()
+
+    return focal
 
 
 class FocalLoss(nn.Module):
@@ -21,6 +58,7 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+
     
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -114,6 +152,13 @@ class FamilyTourLoss(nn.Module):
         # 新增: 模式预测损失
         self.pattern_loss = None
         self.pattern_loss_weights = self.weights.get('pattern', 0.5)
+        self.coordination_loss = FamilyCoordinationLoss(
+            lambda_joint=train_config.lambda_joint if hasattr(train_config, 'lambda_joint') else 1.0,
+            lambda_vehicle=train_config.lambda_vehicle if hasattr(train_config, 'lambda_vehicle') else 2.0,
+            lambda_home=train_config.lambda_home if hasattr(train_config, 'lambda_home') else 1.0,
+        )
+        self.use_coordination = getattr(train_config, 'use_coordination_loss', False)
+        self.coordination_weight = getattr(train_config, 'coordination_weight', 0.5)
     
     def forward(
         self,
@@ -121,7 +166,9 @@ class FamilyTourLoss(nn.Module):
         targets: torch.Tensor,
         member_mask: torch.BoolTensor,
         activity_mask: torch.BoolTensor,
-        pattern_outputs: Dict[str, torch.Tensor] = None  # 新增参数
+        pattern_outputs: Dict[str, torch.Tensor] = None,  # 新增参数
+        home_zones: torch.Tensor = None,
+        num_vehicles: torch.Tensor = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
@@ -222,6 +269,29 @@ class FamilyTourLoss(nn.Module):
             )
             losses['destination'] = dest_loss
             total_loss = total_loss + self.weights.get('destination', 1) * dest_loss
+
+        # ===== 新增：联合活动损失 =====
+
+        if self.use_coordination:
+            coord_loss, coord_losses = self.coordination_loss(
+                predictions,
+                member_mask,
+                activity_mask,
+                num_vehicles=num_vehicles,  # 需要在batch中添加
+                home_zones=home_zones,  # 需要在batch中添加
+            )
+            losses.update({f'coord_{k}': v for k, v in coord_losses.items()})
+            total_loss = total_loss + self.coordination_weight * coord_loss
+
+        # ===== 活动数量控制损失 =====
+        if 'end' in predictions:
+            end_loss = end_token_loss(
+                predictions['end'],
+                activity_mask,
+                member_mask
+            )
+            losses['end_token'] = end_loss
+            total_loss = total_loss + self.weights.get('end_token', 1.0) * end_loss
 
         return total_loss, losses
     

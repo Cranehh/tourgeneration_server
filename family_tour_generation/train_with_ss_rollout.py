@@ -192,12 +192,16 @@ class ScheduledSamplingTrainer:
             loss_tf, losses_tf = self.criterion(
                 predictions_tf, batch.activities,
                 batch.member_mask, batch.activity_mask,
-                pattern_outputs=pattern_probs_tf
+                pattern_outputs=pattern_probs_tf,
+                home_zones=batch.home_zones,
+                num_vehicles=batch.num_vehicles
             )
             loss, losses = self.criterion(
                 predictions, batch.activities,
                 batch.member_mask, batch.activity_mask,
-                pattern_outputs=pattern_probs
+                pattern_outputs=pattern_probs,
+                home_zones=batch.home_zones,
+                num_vehicles=batch.num_vehicles
             )
 
             # 计算指标 (使用自回归生成的结果)
@@ -411,6 +415,7 @@ def main():
     member_mask_train = member_data_train[:, :, -2]
     activity_mask_train = activity_data_train[:, :, :, :27].sum(axis=-1) != 0
 
+
     data = np.load(f'{data_dir}/family_sample_improved_cluster_test.npy')
     family_data_test = np.concatenate([data[:, :10], data[:, -1:]], axis=1)
     member_data_test = np.load(f'{data_dir}/family_member_sample_improved_cluster_test.npy')
@@ -505,7 +510,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_distill',
+        save_dir='../checkpoints_ss_with_condition_joint',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
