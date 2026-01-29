@@ -17,6 +17,7 @@ from ple_encoder import PLEEncoder
 from mtan_decoder import MTANDecoder
 from data import FamilyTourBatch
 from integration import IntegratedPatternPredictor, PatternConditionInjector
+from nash_bargaining_sqp_optnet import HouseholdNashBargainingLayer, UtilityParams
 
 
 
@@ -64,6 +65,95 @@ class FamilyTourGenerator(nn.Module):
         # MTAN Decoder
 
         self.decoder = MTANDecoder(config)
+
+        # 新增: Nash Bargaining 层
+        if getattr(config, 'use_nash_bargaining', False):
+            self.nash_layer = HouseholdNashBargainingLayer(
+                num_zones=2006,
+                num_modes=config.num_modes,
+                max_members=config.max_members,
+                max_tours=config.max_activities,
+                utility_params=UtilityParams(
+                    alpha_joint=config.nash_config.get('alpha_joint', 0.1),
+                    alpha_social=config.nash_config.get('alpha_social', 0.3),
+                    theta_escort=config.nash_config.get('theta_escort', -0.58),
+                    theta_car=config.nash_config.get('theta_car', -1.0),
+                    theta_pt=config.nash_config.get('theta_pt', -0.4)
+                ),
+                sqp_max_iter=config.nash_config.get('sqp_max_iter', 15),
+                sqp_tol=config.nash_config.get('sqp_tol', 1e-4),
+                enabled=True
+            )
+        else:
+            self.nash_layer = None
+        # 加载出行时间矩阵（需要预先准备）
+        self.travel_time_matrix = None  # 需要从外部加载
+
+    def _apply_nash_bargaining(
+            self,
+            predictions: Dict[str, torch.Tensor],
+            batch
+    ) -> Dict[str, torch.Tensor]:
+        """应用 Nash Bargaining 协调层"""
+
+        # 准备输入
+        # 注意：Nash 层需要 departure_time 和 duration，但模型输出是 continuous[..., 0] 和 continuous[..., 1]
+        departure_time = predictions['continuous'][..., 0]  # [B, M, T]
+        duration = predictions['continuous'][..., 1] - predictions['continuous'][..., 0]  # 计算持续时间
+
+        # 确保 duration 为正
+        duration = torch.clamp(duration, min=0.01)
+
+        # 准备 member_is_adult（需要从 batch 或 member_attr 中提取）
+        # 假设 member_attr 中第 0 维是年龄或类似指标
+        member_is_adult = (batch.member_attr[..., 0] > 18).float()  # 需要根据实际数据调整
+
+        # 调用 Nash 层
+        nash_output = self.nash_layer(
+            departure_time=departure_time,
+            duration=duration,
+            destination_logits=predictions['destination'],
+            mode_logits=predictions['mode'],
+            is_joint_logit=predictions['joint'][..., 1] - predictions['joint'][..., 0],  # 转为单值 logit
+            is_driver_logit=predictions['driver'][..., 1] - predictions['driver'][..., 0],
+            member_mask=batch.member_mask.float(),
+            tour_mask=batch.activity_mask.float(),
+            num_vehicles=batch.num_vehicles if batch.num_vehicles is not None else torch.ones(batch.batch_size,
+                                                                                              device=batch.device),
+            home_zone=batch.home_zones,
+            member_is_adult=member_is_adult,
+            travel_time_matrix=self.travel_time_matrix,
+        )
+
+        # 将 Nash 输出转换回原格式
+        coordinated_predictions = predictions.copy()
+
+        # 更新 continuous（从 departure + duration 恢复）
+        coordinated_continuous = torch.stack([
+            nash_output.departure_time,
+            nash_output.departure_time + nash_output.duration
+        ], dim=-1)
+        coordinated_predictions['continuous'] = coordinated_continuous
+
+        # 更新 destination (logits)
+        coordinated_predictions['destination'] = nash_output.destination_logits
+
+        # 更新 mode (logits)
+        coordinated_predictions['mode'] = nash_output.mode_logits
+
+        # 更新 joint (转回 2-class logits)
+        joint_logit = nash_output.is_joint_logit
+        coordinated_predictions['joint'] = torch.stack([
+            -joint_logit / 2, joint_logit / 2
+        ], dim=-1)
+
+        # 更新 driver (转回 2-class logits)
+        driver_logit = nash_output.is_driver_logit
+        coordinated_predictions['driver'] = torch.stack([
+            -driver_logit / 2, driver_logit / 2
+        ], dim=-1)
+
+        return coordinated_predictions
     def forward(
         self,
         batch: FamilyTourBatch,
@@ -121,6 +211,10 @@ class FamilyTourGenerator(nn.Module):
                 member_mask=batch.member_mask,
                 home_zones=batch.home_zones  # 新增
             )
+
+        # Nash 协调
+        if self.nash_layer is not None and self.training:
+            predictions = self._apply_nash_bargaining(predictions, batch)
         
         return predictions, pattern_probs
     

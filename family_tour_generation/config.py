@@ -66,6 +66,20 @@ class ModelConfig:
     gumbel_temperature: float = 1.0  # Gumbel-Softmax 温度，训练时可逐渐降低
     use_soft_distance: bool = True  # 是否使用期望距离（软加权）
 
+    # Nash Bargaining 配置
+    use_nash_bargaining: bool = False
+    nash_config: dict = field(default_factory=lambda: {
+        'num_zones': 2006,
+        'num_modes': 11,
+        'alpha_joint': 0.1,
+        'alpha_social': 0.3,
+        'theta_escort': -0.58,
+        'theta_car': -1.0,
+        'theta_pt': -0.4,
+        'sqp_max_iter': 150,
+        'sqp_tol': 1e-4,
+    })
+
 
 
     
