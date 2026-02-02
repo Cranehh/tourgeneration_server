@@ -251,7 +251,8 @@ class ScheduledSamplingDecoder(nn.Module):
         training: bool = True,
         pattern_outputs: Dict[str, torch.Tensor] = None,  # 新增
         home_zones = None,
-        target_destinations = None
+        target_destinations = None,
+        batch = None
     ) -> Dict[str, torch.Tensor]:
         """
         带 Scheduled Sampling 的前向传播
@@ -288,7 +289,8 @@ class ScheduledSamplingDecoder(nn.Module):
                 member_mask, activity_mask,
                 pattern_outputs=pattern_outputs,
                 home_zones = home_zones,
-                target_destinations = target_destinations
+                target_destinations = target_destinations,
+                batch = batch
             )
         
         # 混合模式: 逐步决定使用真实标签还是预测
@@ -632,7 +634,8 @@ class ExposureBiasTrainer:
             training=True,
             pattern_outputs=pattern_prob,  # 传递模式概率,
             home_zones=batch.home_zones,
-            target_destinations=batch.target_destinations
+            target_destinations=batch.target_destinations,
+            batch=batch
         )
         pattern_prob.update({
             'family_pattern_target': batch.family_pattern,

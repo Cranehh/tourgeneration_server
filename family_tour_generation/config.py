@@ -1,8 +1,7 @@
 """
 配置类定义
 """
-from dataclasses import dataclass
-
+from dataclasses import dataclass, field
 
 @dataclass
 class ModelConfig:
@@ -67,7 +66,7 @@ class ModelConfig:
     use_soft_distance: bool = True  # 是否使用期望距离（软加权）
 
     # Nash Bargaining 配置
-    use_nash_bargaining: bool = False
+    use_nash_bargaining: bool = True
     nash_config: dict = field(default_factory=lambda: {
         'num_zones': 2006,
         'num_modes': 11,

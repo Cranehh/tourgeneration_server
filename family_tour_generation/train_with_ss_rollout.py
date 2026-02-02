@@ -510,7 +510,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_joint',
+        save_dir='../checkpoints_ss_with_condition_nash',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
