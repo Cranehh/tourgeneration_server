@@ -75,9 +75,10 @@ class ModelConfig:
         'theta_escort': -0.58,
         'theta_car': -1.0,
         'theta_pt': -0.4,
-        'sqp_max_iter': 150,
+        'sqp_max_iter': 15,
         'sqp_tol': 1e-4,
     })
+    nash_bargaining_start_epoch: int = 20  # 从第几个epoch开始使用Nash Bargaining
 
 
 
@@ -119,5 +120,5 @@ class TrainConfig:
     lambda_joint: float = 1.0
     lambda_vehicle: float = 2.0
     lambda_home: float = 1.0
-    use_coordination_loss: bool = True
+    use_coordination_loss: bool = False
     coordination_weight: float = 0.5

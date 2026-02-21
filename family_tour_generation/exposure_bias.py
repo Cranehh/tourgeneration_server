@@ -252,7 +252,8 @@ class ScheduledSamplingDecoder(nn.Module):
         pattern_outputs: Dict[str, torch.Tensor] = None,  # 新增
         home_zones = None,
         target_destinations = None,
-        batch = None
+        batch = None,
+        current_epoch = None
     ) -> Dict[str, torch.Tensor]:
         """
         带 Scheduled Sampling 的前向传播
@@ -290,7 +291,8 @@ class ScheduledSamplingDecoder(nn.Module):
                 pattern_outputs=pattern_outputs,
                 home_zones = home_zones,
                 target_destinations = target_destinations,
-                batch = batch
+                batch = batch,
+                current_epoch = current_epoch
             )
         
         # 混合模式: 逐步决定使用真实标签还是预测
@@ -299,7 +301,9 @@ class ScheduledSamplingDecoder(nn.Module):
             member_mask, activity_mask, tf_prob,
             pattern_outputs=pattern_outputs,
             home_zones=home_zones,
-            target_destinations=target_destinations
+            target_destinations=target_destinations,
+            batch = batch,
+            current_epoch=current_epoch
         )
     
     def _forward_scheduled_sampling(
@@ -312,7 +316,9 @@ class ScheduledSamplingDecoder(nn.Module):
         tf_prob: float,
         pattern_outputs: Dict[str, torch.Tensor] = None,  # 新增
         home_zones: torch.Tensor = None,  # 新增: [B]
-        target_destinations: torch.Tensor = None  # 新增: [B, M, T] 用于计算origin
+        target_destinations: torch.Tensor = None,  # 新增: [B, M, T] 用于计算origin
+        batch = None,
+        current_epoch = None
     ) -> Dict[str, torch.Tensor]:
         """
         Scheduled Sampling 前向传播
@@ -502,9 +508,8 @@ class ScheduledSamplingDecoder(nn.Module):
                         real_destination,
                         pred_destination
                     )
-        
-        # 堆叠结果
-        return {
+
+        predictions = {
             'continuous': torch.stack(all_predictions['continuous'], dim=2),
             'purpose': torch.stack(all_predictions['purpose'], dim=2),
             'mode': torch.stack(all_predictions['mode'], dim=2),
@@ -513,6 +518,11 @@ class ScheduledSamplingDecoder(nn.Module):
             'destination': torch.stack(all_predictions['destination'], dim=2) if all_predictions['destination'] else None,
             'end': torch.stack(all_predictions['end'], dim=2)
         }
+
+        if self.decoder.nash_layer is not None and current_epoch >= self.config.nash_bargaining_start_epoch:
+            predictions = self.decoder._apply_nash_bargaining(predictions, batch)
+        # 堆叠结果
+        return predictions
     
     def _construct_activity_tensor(
         self,
@@ -635,7 +645,8 @@ class ExposureBiasTrainer:
             pattern_outputs=pattern_prob,  # 传递模式概率,
             home_zones=batch.home_zones,
             target_destinations=batch.target_destinations,
-            batch=batch
+            batch=batch,
+            current_epoch = current_epoch
         )
         pattern_prob.update({
             'family_pattern_target': batch.family_pattern,

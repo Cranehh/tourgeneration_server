@@ -1001,7 +1001,7 @@ class MTANDecoder(nn.Module):
 
         # 准备 member_is_adult（需要从 batch 或 member_attr 中提取）
         # 假设 member_attr 中第 0 维是年龄或类似指标
-        member_is_adult = (batch.member_attr[..., 0] > 18).float()  # 需要根据实际数据调整
+        member_is_adult = ((batch.member_attr[..., 0]*3.4856215 + 8.42397611) > 3.6).float()  # 需要根据实际数据调整
 
         # 调用 Nash 层
         nash_output = self.nash_layer(
@@ -1028,13 +1028,23 @@ class MTANDecoder(nn.Module):
             nash_output.departure_time,
             nash_output.departure_time + nash_output.duration
         ], dim=-1)
-        coordinated_predictions['continuous'] = coordinated_continuous
+        coordinated_predictions['continuous'][..., 0] = coordinated_continuous[..., 0]
+
+        if torch.isnan(coordinated_predictions['continuous']).any() or torch.isinf(coordinated_predictions['continuous']).any():
+            print("Warning: NaN or Inf detected in coordinated continuous predictions.")
+            print(f'number of NaNs: {torch.isnan(coordinated_predictions["continuous"]).sum().item()}')
+            print(f'number of Infs: {torch.isinf(coordinated_predictions["continuous"]).sum().item()}')
 
         # 更新 destination (logits)
-        coordinated_predictions['destination'] = nash_output.destination_logits
+        # coordinated_predictions['destination'] = nash_output.destination_logits
 
         # 更新 mode (logits)
         coordinated_predictions['mode'] = nash_output.mode_logits
+
+        if torch.isnan(coordinated_predictions['mode']).any() or torch.isinf(coordinated_predictions['mode']).any():
+            print("Warning: NaN or Inf detected in coordinated mode predictions.")
+            print(f'number of NaNs: {torch.isnan(coordinated_predictions["mode"]).sum().item()}')
+            print(f'number of Infs: {torch.isinf(coordinated_predictions["mode"]).sum().item()}')
 
         # 更新 joint (转回 2-class logits)
         joint_logit = nash_output.is_joint_logit
@@ -1042,11 +1052,21 @@ class MTANDecoder(nn.Module):
             -joint_logit / 2, joint_logit / 2
         ], dim=-1)
 
+        if torch.isnan(coordinated_predictions['joint']).any() or torch.isinf(coordinated_predictions['joint']).any():
+            print("Warning: NaN or Inf detected in coordinated joint predictions.")
+            print(f'number of NaNs: {torch.isnan(coordinated_predictions["joint"]).sum().item()}')
+            print(f'number of Infs: {torch.isinf(coordinated_predictions["joint"]).sum().item()}')
+
         # 更新 driver (转回 2-class logits)
         driver_logit = nash_output.is_driver_logit
         coordinated_predictions['driver'] = torch.stack([
             -driver_logit / 2, driver_logit / 2
         ], dim=-1)
+
+        if torch.isnan(coordinated_predictions['driver']).any() or torch.isinf(coordinated_predictions['driver']).any():
+            print("Warning: NaN or Inf detected in coordinated driver predictions.")
+            print(f'number of NaNs: {torch.isnan(coordinated_predictions["driver"]).sum().item()}')
+            print(f'number of Infs: {torch.isinf(coordinated_predictions["driver"]).sum().item()}')
 
         return coordinated_predictions
 
@@ -1060,7 +1080,8 @@ class MTANDecoder(nn.Module):
         pattern_outputs: Dict[str, torch.Tensor] = None,
         home_zones: torch.Tensor = None,  # 新增: [B]
         target_destinations: torch.Tensor = None,  # 新增: [B, M, T] 用于计算origin
-        batch = None  # 新增: 传入整个batch以便Nash层使用
+        batch = None,  # 新增: 传入整个batch以便Nash层使用
+        current_epoch=None
     ) -> Dict[str, torch.Tensor]:
         """
         训练阶段: Teacher Forcing
@@ -1205,9 +1226,9 @@ class MTANDecoder(nn.Module):
         )
 
         # Nash 协调
-        if self.nash_layer is not None:
+        if self.nash_layer is not None and current_epoch>=self.config.nash_bargaining_start_epoch:
             predictions = self._apply_nash_bargaining(predictions, batch)
-        
+
         return predictions
     
     def _apply_time_constraints(
@@ -1260,6 +1281,8 @@ class MTANDecoder(nn.Module):
         max_length: int = None,
         pattern_outputs: Dict[str, torch.Tensor] = None, # 新增参数,
         home_zones: torch.Tensor = None,  # 新增: [B]
+        batch=None,  # 新增: 传入整个batch以便Nash层使用,
+        current_epoch=None
     ) -> Dict[str, torch.Tensor]:
         """
         推理阶段: 自回归生成
@@ -1430,6 +1453,8 @@ class MTANDecoder(nn.Module):
         if generated_destination:
             results['destination'] = torch.stack(generated_destination, dim=2)
 
+        if self.nash_layer is not None and current_epoch >= self.config.nash_bargaining_start_epoch:
+            results = self._apply_nash_bargaining(results, batch)
         # 堆叠结果
         return results
 

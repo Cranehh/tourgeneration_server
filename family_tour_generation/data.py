@@ -100,7 +100,7 @@ class FamilyTourDataset(Dataset):
             'home_zone': torch.tensor(home_zone, dtype=torch.long),           # 新增
             'target_destinations': target_destinations,
             'work_positions': self.member_data[idx][:, -1].long(),
-            'num_vehicle': self.family_data[idx][2].long() * 0.53169051 + 0.50155405,
+            'num_vehicle': self.family_data[idx][2] * 0.53169051 + 0.50155405,
         }
 
 

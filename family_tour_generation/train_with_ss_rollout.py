@@ -156,7 +156,8 @@ class ScheduledSamplingTrainer:
         return {'total': avg_loss, **avg_components}
 
     @torch.no_grad()
-    def validate(self):
+    def validate(self,
+                 epoch: int):
         """验证"""
         if self.val_loader is None:
             return {}
@@ -174,7 +175,7 @@ class ScheduledSamplingTrainer:
 
             # 使用纯自回归模式验证 (模拟真实推理)
             predictions, pattern_probs = self.model.generate(
-                batch.family_attr, batch.member_attr, batch.member_mask, home_zones=batch.home_zones, work_positions=batch.work_positions
+                batch.family_attr, batch.member_attr, batch.member_mask, home_zones=batch.home_zones, work_positions=batch.work_positions, batch=batch, current_epoch=epoch
             )
             # pattern_probs.update({
             #     'family_pattern_target': batch.family_pattern,
@@ -184,7 +185,7 @@ class ScheduledSamplingTrainer:
             # 调整预测格式以计算损失
             # generate 返回的 purpose, mode 等是索引，需要转换为 logits 格式
             # 这里简化处理，用 teacher forcing 计算损失
-            predictions_tf, pattern_probs_tf = self.model(batch, teacher_forcing=True)
+            predictions_tf, pattern_probs_tf = self.model(batch, teacher_forcing=True, current_epoch=epoch)
             # pattern_probs_tf.update({
             #     'family_pattern_target': batch.family_pattern,
             #     'individual_pattern_target': batch.member_pattern,
@@ -300,7 +301,7 @@ class ScheduledSamplingTrainer:
 
             # 验证
             if (epoch + 1) % 1 == 0:
-                val_metrics = self.validate()
+                val_metrics = self.validate(epoch)
                 if val_metrics:
                     logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['val_total']:.4f} - TF Val Loss: {val_metrics['val_total_tf']:.4f}")
 

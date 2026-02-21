@@ -67,7 +67,8 @@ class FamilyTourGenerator(nn.Module):
     def forward(
         self,
         batch: FamilyTourBatch,
-        teacher_forcing: bool = True
+        teacher_forcing: bool = True,
+        current_epoch=None
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -111,7 +112,9 @@ class FamilyTourGenerator(nn.Module):
                 activity_mask=batch.activity_mask,
                 pattern_outputs=pattern_probs,
                 home_zones = batch.home_zones,  # 新增
-                target_destinations = batch.target_destinations  # 新增
+                target_destinations = batch.target_destinations,  # 新增
+                batch=batch,  # 新增: 传入整个batch以便Nash层使用
+                current_epoch=current_epoch
             )
         else:
             # 推理模式: 自回归生成
@@ -133,6 +136,8 @@ class FamilyTourGenerator(nn.Module):
         max_length: int = None,
         home_zones=None,
         work_positions=None,
+        batch = None,
+        current_epoch =None
     ) -> Tuple[Dict[str, Tensor], Any]:
         """
         生成活动链 (推理接口)
@@ -165,7 +170,9 @@ class FamilyTourGenerator(nn.Module):
             member_mask=member_mask,
             max_length=max_length,
             pattern_outputs=pattern_prob,
-            home_zones=home_zones), pattern_prob
+            home_zones=home_zones,
+            batch=batch,
+            current_epoch=current_epoch), pattern_prob,
     
     def get_encoder_output(
         self,
