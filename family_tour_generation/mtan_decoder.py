@@ -14,7 +14,7 @@ from config import ModelConfig
 from embedding import ActivityEmbedding, PositionalEncoding
 from zone_embedding import DistanceAwareModeHead  # 新增
 import numpy as np
-from nash_bargaining_sqp_optnet import HouseholdNashBargainingLayer, UtilityParams
+from nash_bargaining_sqp_optnet import NashBargainingSQPOptNet, create_nash_layer_from_config
 
 
 # ==================== 新增：模式条件模块 ====================
@@ -957,22 +957,7 @@ class MTANDecoder(nn.Module):
             )
         # 新增: Nash Bargaining 层
         if getattr(config, 'use_nash_bargaining', False):
-            self.nash_layer = HouseholdNashBargainingLayer(
-                num_zones=2006,
-                num_modes=config.num_modes,
-                max_members=config.max_members,
-                max_tours=config.max_activities,
-                utility_params=UtilityParams(
-                    alpha_joint=config.nash_config.get('alpha_joint', 0.1),
-                    alpha_social=config.nash_config.get('alpha_social', 0.3),
-                    theta_escort=config.nash_config.get('theta_escort', -0.58),
-                    theta_car=config.nash_config.get('theta_car', -1.0),
-                    theta_pt=config.nash_config.get('theta_pt', -0.4)
-                ),
-                sqp_max_iter=config.nash_config.get('sqp_max_iter', 15),
-                sqp_tol=config.nash_config.get('sqp_tol', 1e-4),
-                enabled=True
-            )
+            self.nash_layer = create_nash_layer_from_config(config)
         else:
             self.nash_layer = None
         # 加载出行时间矩阵（需要预先准备）
@@ -989,86 +974,24 @@ class MTANDecoder(nn.Module):
             predictions: Dict[str, torch.Tensor],
             batch
     ) -> Dict[str, torch.Tensor]:
-        """应用 Nash Bargaining 协调层"""
+        """Apply Nash Bargaining coordination layer.
 
-        # 准备输入
-        # 注意：Nash 层需要 departure_time 和 duration，但模型输出是 continuous[..., 0] 和 continuous[..., 1]
-        departure_time = predictions['continuous'][..., 0]  # [B, M, T]
-        duration = predictions['continuous'][..., 1] - predictions['continuous'][..., 0]  # 计算持续时间
+        Directly passes predictions dict to Nash layer.
+        Nash layer only modifies continuous, mode, joint, driver.
+        """
+        member_is_adult = ((batch.member_attr[..., 0] * 3.4856215 + 8.42397611) > 3.6).float()
 
-        # 确保 duration 为正
-        duration = torch.clamp(duration, min=0.01)
-
-        # 准备 member_is_adult（需要从 batch 或 member_attr 中提取）
-        # 假设 member_attr 中第 0 维是年龄或类似指标
-        member_is_adult = ((batch.member_attr[..., 0]*3.4856215 + 8.42397611) > 3.6).float()  # 需要根据实际数据调整
-
-        # 调用 Nash 层
-        nash_output = self.nash_layer(
-            departure_time=departure_time,
-            duration=duration,
-            destination_logits=predictions['destination'],
-            mode_logits=predictions['mode'],
-            is_joint_logit=predictions['joint'][..., 1] - predictions['joint'][..., 0],  # 转为单值 logit
-            is_driver_logit=predictions['driver'][..., 1] - predictions['driver'][..., 0],
+        return self.nash_layer(
+            predictions=predictions,
             member_mask=batch.member_mask.float(),
-            tour_mask=batch.activity_mask.float(),
-            num_vehicles=batch.num_vehicles if batch.num_vehicles is not None else torch.ones(batch.batch_size,
-                                                                                              device=batch.device),
+            activity_mask=batch.activity_mask.float(),
+            num_vehicles=batch.num_vehicles if batch.num_vehicles is not None else torch.ones(
+                batch.member_mask.shape[0], device=batch.member_mask.device
+            ),
             home_zone=batch.home_zones,
             member_is_adult=member_is_adult,
             travel_time_matrix=self.travel_time_matrix,
         )
-
-        # 将 Nash 输出转换回原格式
-        coordinated_predictions = predictions.copy()
-
-        # 更新 continuous（从 departure + duration 恢复）
-        coordinated_continuous = torch.stack([
-            nash_output.departure_time,
-            nash_output.departure_time + nash_output.duration
-        ], dim=-1)
-        coordinated_predictions['continuous'][..., 0] = coordinated_continuous[..., 0]
-
-        if torch.isnan(coordinated_predictions['continuous']).any() or torch.isinf(coordinated_predictions['continuous']).any():
-            print("Warning: NaN or Inf detected in coordinated continuous predictions.")
-            print(f'number of NaNs: {torch.isnan(coordinated_predictions["continuous"]).sum().item()}')
-            print(f'number of Infs: {torch.isinf(coordinated_predictions["continuous"]).sum().item()}')
-
-        # 更新 destination (logits)
-        # coordinated_predictions['destination'] = nash_output.destination_logits
-
-        # 更新 mode (logits)
-        coordinated_predictions['mode'] = nash_output.mode_logits
-
-        if torch.isnan(coordinated_predictions['mode']).any() or torch.isinf(coordinated_predictions['mode']).any():
-            print("Warning: NaN or Inf detected in coordinated mode predictions.")
-            print(f'number of NaNs: {torch.isnan(coordinated_predictions["mode"]).sum().item()}')
-            print(f'number of Infs: {torch.isinf(coordinated_predictions["mode"]).sum().item()}')
-
-        # 更新 joint (转回 2-class logits)
-        joint_logit = nash_output.is_joint_logit
-        coordinated_predictions['joint'] = torch.stack([
-            -joint_logit / 2, joint_logit / 2
-        ], dim=-1)
-
-        if torch.isnan(coordinated_predictions['joint']).any() or torch.isinf(coordinated_predictions['joint']).any():
-            print("Warning: NaN or Inf detected in coordinated joint predictions.")
-            print(f'number of NaNs: {torch.isnan(coordinated_predictions["joint"]).sum().item()}')
-            print(f'number of Infs: {torch.isinf(coordinated_predictions["joint"]).sum().item()}')
-
-        # 更新 driver (转回 2-class logits)
-        driver_logit = nash_output.is_driver_logit
-        coordinated_predictions['driver'] = torch.stack([
-            -driver_logit / 2, driver_logit / 2
-        ], dim=-1)
-
-        if torch.isnan(coordinated_predictions['driver']).any() or torch.isinf(coordinated_predictions['driver']).any():
-            print("Warning: NaN or Inf detected in coordinated driver predictions.")
-            print(f'number of NaNs: {torch.isnan(coordinated_predictions["driver"]).sum().item()}')
-            print(f'number of Infs: {torch.isinf(coordinated_predictions["driver"]).sum().item()}')
-
-        return coordinated_predictions
 
     def forward(
         self,

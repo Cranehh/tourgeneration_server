@@ -1,17 +1,27 @@
 """
-家庭层面 Nash Bargaining 协调层 (重新设计版 V3)
+家庭层面 Nash Bargaining 协调层 (重构版 V4)
 基于 SQP + OptNet 的可微优化实现
 
-修复问题:
-1. SQP迭代过程中加入完整约束条件
-2. 确保OptNet的QP参数(Q,p,G,h,A,b)显式依赖神经网络输出θ，保证梯度可传播
-5. 完整构建约束：概率归一化、车辆约束、边界约束
-6. 效用函数与讨论的数学模型一致
+重构要点:
+1. 直接使用 decoder 原生输出（predictions dict）
+2. 去掉偏好惩罚项，改用 soft anchor λ·‖x-θ‖²
+3. 加入联合出行一致性硬约束
+4. 不优化 purpose, destination, end token
 
-核心设计原则:
-- SQP中间迭代: 无需保持计算图，用于找到好的收敛点
-- 最后一步OptNet: 基于收敛点x_k和原始神经网络输出θ，重新构建QP参数
-- QP参数(Q,p,A,b,G,h)显式依赖θ，OptNet通过KKT条件的隐函数定理计算dx*/dθ
+优化变量（每成员每活动15个）:
+  [start_time(1), end_time(1), mode_prob(11), joint_prob(1), driver_prob(1)]
+
+效用函数（无偏好项）:
+  U_n = U_baseline(10.0)
+      + α_social × Σ_t out_of_home_prob(t) × mask(t)
+      + α_joint × Σ_t joint_prob(t) × mask(t)
+      + θ_escort × Σ_t driver_prob(t) × (end-start)(t) × is_adult(n) × mask(t)
+      + Σ_t Σ_k mode_prob(t,k) × θ_travel(k) × expected_tt(t,k) × out_of_home(t) × mask(t)
+
+两阶段求解:
+  Phase 1: SQP (BFGS + Armijo) → x_converged (无梯度)
+  Phase 2: OptNet QP → d* (有梯度，通过 θ_packed)
+  x_final = θ_packed + (x_converged - θ_packed).detach() + d*
 
 Author: 郝赫
 Date: 2025
@@ -21,11 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Dict, List, Tuple, Optional, NamedTuple
-from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
 import math
 
-# 导入 qpth (OptNet)
 try:
     from qpth.qp import QPFunction
     QPTH_AVAILABLE = True
@@ -34,628 +42,411 @@ except ImportError:
     print("Warning: qpth not available. Install with: pip install qpth")
 
 
-# =============================================================================
-#                              数据结构定义
-# =============================================================================
-
-@dataclass
-class UtilityParams:
-    """效用函数参数 (Rezvany et al. 2023)"""
-    alpha_joint: float = 0.1        # 联合活动奖励
-    alpha_social: float = 0.3       # 外出奖励 (偏好外出而非在家)
-    theta_escort: float = -0.58     # 接送惩罚
-    theta_car: float = -1.0         # 小汽车时间系数
-    theta_pt: float = -0.4          # 公交时间系数
-    theta_walk: float = -1.5        # 步行时间系数
-    theta_bike: float = -0.8        # 骑行时间系数
-    beta_time: float = 1.0          # 时间偏差惩罚
-    gamma_duration: float = 1.0     # 持续时间偏差惩罚
-    utility_baseline: float = 10.0  # 基准效用 (确保U>0)
-
-
-class NashBargainingOutput(NamedTuple):
-    """输出结构"""
-    departure_time: Tensor          # [batch, max_members, max_tours]
-    duration: Tensor                # [batch, max_members, max_tours]
-    destination_logits: Tensor      # [batch, max_members, max_tours, num_zones]
-    mode_logits: Tensor             # [batch, max_members, max_tours, num_modes]
-    is_joint_logit: Tensor          # [batch, max_members, max_tours]
-    is_driver_logit: Tensor         # [batch, max_members, max_tours]
-    nash_welfare: Tensor            # [batch] Nash社会福利
-    converged: Tensor               # [batch] 是否收敛
-
-
-# =============================================================================
-#                          核心：Nash Bargaining QP Layer
-# =============================================================================
-
-class NashBargainingQPLayer(nn.Module):
+class NashBargainingSQPOptNet(nn.Module):
     """
-    Nash Bargaining 协调层 (重新设计版)
+    Nash Bargaining SQP + OptNet layer.
 
-    关键改进:
-    1. SQP迭代中包含完整约束
-    2. 最后一步OptNet的QP参数显式依赖神经网络输出θ
-    3. 完整的约束构建
+    Directly accepts and returns predictions dict from decoder.
+    Only modifies: continuous (start/end time), mode, joint, driver.
+    Does NOT modify: purpose, destination, end.
     """
 
     def __init__(
         self,
-        num_zones: int,
-        num_modes: int = 4,
-        max_members: int = 6,
-        max_tours: int = 8,
-        utility_params: Optional[UtilityParams] = None,
-        sqp_max_iter: int = 10,
+        num_modes: int = 11,
+        max_members: int = 8,
+        max_activities: int = 6,
+        alpha_joint: float = 0.1,
+        alpha_social: float = 0.3,
+        theta_escort: float = -0.58,
+        utility_baseline: float = 10.0,
+        lambda_anchor: float = 0.1,
+        joint_consistency_threshold: float = 0.5,
+        car_mode_indices: list = None,
+        sqp_max_iter: int = 15,
         sqp_tol: float = 1e-4,
     ):
         super().__init__()
 
-        self.num_zones = num_zones
         self.num_modes = num_modes
         self.max_members = max_members
-        self.max_tours = max_tours
+        self.max_activities = max_activities
+        self.alpha_joint = alpha_joint
+        self.alpha_social = alpha_social
+        self.theta_escort = theta_escort
+        self.utility_baseline = utility_baseline
+        self.lambda_anchor = lambda_anchor
+        self.joint_consistency_threshold = joint_consistency_threshold
+        self.car_mode_indices = car_mode_indices or [7]
         self.sqp_max_iter = sqp_max_iter
         self.sqp_tol = sqp_tol
 
-        # 效用参数
-        self.params = utility_params or UtilityParams()
+        # Variables per activity: start(1) + end(1) + mode_prob(num_modes) + joint_prob(1) + driver_prob(1)
+        self.vars_per_activity = 2 + num_modes + 2
+        self.vars_per_member = max_activities * self.vars_per_activity
+        self.total_vars = max_members * self.vars_per_member
 
-        # 出行时间系数 (按mode索引)
-        self.register_buffer('theta_travel', torch.tensor([
-          self.params.theta_walk,
-          self.params.theta_car,
-          self.params.theta_car,
-          self.params.theta_pt,
-          self.params.theta_walk,
-          self.params.theta_pt,
-          self.params.theta_bike,
-          self.params.theta_bike,
-          self.params.theta_car,
-          self.params.theta_car,
-          self.params.theta_car,
-          self.params.theta_car
-      ][:num_modes]))
+        # Travel time coefficients per mode (11 modes)
+        # 0:walk(-1.5) 1:bus(-0.4) 2:metro(-0.4) 3:bike(-0.8) 4:ebike(-0.8)
+        # 5:car(-1.0) 6:other_motor(-1.0) 7:shuttle(-0.4) 8:taxi(-1.0) 9:motorcycle(-0.8) 10:other(-0.5)
+        theta_travel = torch.tensor([
+            -1.5, -0.4, -0.4, -0.8, -0.8,
+            -1.0, -1.0, -0.4, -1.0, -0.8, -0.5
+        ][:num_modes])
+        self.register_buffer('theta_travel', theta_travel)
 
-        # 变量布局：每个tour的变量
-        # [departure(1), duration(1), mode_prob(M), joint_prob(1), driver_prob(1)]
-        # 注意：目的地单独处理(维度太高)，通过at_home_prob简化
-        self.vars_per_tour = 2 + num_modes + 2  # departure + duration + mode + joint + driver
-        self.total_vars_per_member = max_tours * self.vars_per_tour
-        self.total_vars = max_members * self.total_vars_per_member
+        # Time z-score bounds: mean=12.946, std=4.691
+        self.time_mean = 12.946
+        self.time_std = 4.691
+        self.z_min = (1 - self.time_mean) / self.time_std     # ≈ -2.55
+        self.z_max = (24 - self.time_mean) / self.time_std    # ≈ 2.36
+
+        self.eps = 1e-6
+        self.enabled = True
+
+    def set_enabled(self, enabled: bool):
+        """Dynamically enable/disable the Nash layer."""
+        self.enabled = enabled
+
+    # =====================================================================
+    #                         Forward Pass
+    # =====================================================================
 
     def forward(
         self,
-        # 神经网络输出 (θ)
-        departure_time: Tensor,         # [batch, max_members, max_tours]
-        duration: Tensor,               # [batch, max_members, max_tours]
-        destination_logits: Tensor,     # [batch, max_members, max_tours, num_zones]
-        mode_logits: Tensor,            # [batch, max_members, max_tours, num_modes]
-        is_joint_logit: Tensor,         # [batch, max_members, max_tours]
-        is_driver_logit: Tensor,        # [batch, max_members, max_tours]
-        # Mask
-        member_mask: Tensor,            # [batch, max_members]
-        tour_mask: Tensor,              # [batch, max_members, max_tours]
-        # 家庭信息
-        num_vehicles: Tensor,           # [batch]
-        home_zone: Tensor,              # [batch]
-        member_is_adult: Tensor,        # [batch, max_members]
-        # 出行时间矩阵
-        travel_time_matrix: Tensor,     # [num_zones, num_zones, num_modes] 或 [batch, ...]
-        # 偏好 (可选)
-        preferred_departure: Optional[Tensor] = None,
-        preferred_duration: Optional[Tensor] = None,
-        activity_flexibility: Optional[Tensor] = None,
-    ) -> NashBargainingOutput:
-        """前向传播"""
-        batch_size = departure_time.shape[0]
-        device = departure_time.device
-        dtype = departure_time.dtype
+        predictions: Dict[str, Tensor],  # decoder output dict
+        member_mask: Tensor,             # [B, M]
+        activity_mask: Tensor,           # [B, M, T]
+        num_vehicles: Tensor,            # [B]
+        home_zone: Tensor,               # [B]
+        member_is_adult: Tensor,         # [B, M]
+        travel_time_matrix: Tensor,      # [Z, Z] or [Z, Z, K]
+    ) -> Dict[str, Tensor]:
+        """Forward pass. Returns modified predictions dict."""
+        if not self.enabled:
+            return predictions
 
-        # 默认偏好
-        if preferred_departure is None:
-            preferred_departure = departure_time.detach()
-        if preferred_duration is None:
-            preferred_duration = duration.detach()
-        if activity_flexibility is None:
-            activity_flexibility = torch.ones_like(departure_time)
+        # Work in float32 for numerical stability (disable AMP)
+        with torch.amp.autocast('cuda', enabled=False):
+            preds_f32 = {
+                k: v.float() if torch.is_tensor(v) else v
+                for k, v in predictions.items()
+            }
+            result = self._forward_impl(
+                preds_f32,
+                member_mask.float(),
+                activity_mask.float(),
+                num_vehicles.float(),
+                home_zone,
+                member_is_adult.float(),
+                travel_time_matrix.float(),
+            )
 
-        # 预计算从家到各zone的期望出行时间 [batch, num_zones, num_modes]
-        expected_tt = self._get_home_to_zone_tt(home_zone, travel_time_matrix)
+        return result
 
-        # 打包神经网络输出为初始点
-        x0 = self._pack_variables(
-            departure_time, duration, mode_logits, is_joint_logit, is_driver_logit
-        )
-
-        # 构建变量mask
-        var_mask = self._build_variable_mask(member_mask, tour_mask)
-
-        # =====================================================================
-        # 阶段1: SQP迭代找到收敛点 (无需计算图)
-        # =====================================================================
-        x_converged = self._sqp_iterations(
-            x0=x0,
-            var_mask=var_mask,
-            member_mask=member_mask,
-            tour_mask=tour_mask,
-            num_vehicles=num_vehicles,
-            member_is_adult=member_is_adult,
-            expected_tt=expected_tt,
-            destination_logits=destination_logits.detach(),  # 目的地固定
-            home_zone=home_zone,
-            pref_departure=preferred_departure,
-            pref_duration=preferred_duration,
-            flexibility=activity_flexibility,
-        )
-
-        # =====================================================================
-        # 阶段2: 在收敛点构建最终QP，使用OptNet求解并反传梯度
-        # =====================================================================
-        x_final, converged = self._final_optnet_step(
-            x_converged=x_converged,
-            theta_departure=departure_time,      # 原始神经网络输出 (保持计算图)
-            theta_duration=duration,
-            theta_mode_logits=mode_logits,
-            theta_joint_logit=is_joint_logit,
-            theta_driver_logit=is_driver_logit,
-            theta_destination_logits=destination_logits,
-            var_mask=var_mask,
-            member_mask=member_mask,
-            tour_mask=tour_mask,
-            num_vehicles=num_vehicles,
-            member_is_adult=member_is_adult,
-            expected_tt=expected_tt,
-            home_zone=home_zone,
-            pref_departure=preferred_departure,
-            pref_duration=preferred_duration,
-            flexibility=activity_flexibility,
-        )
-
-        # 解包
-        out_departure, out_duration, out_mode_logits, out_joint_logit, out_driver_logit = \
-            self._unpack_variables(x_final)
-
-        # 应用mask
-        out_departure = torch.where(tour_mask.bool(), out_departure, departure_time)
-        out_duration = torch.where(tour_mask.bool(), out_duration, duration)
-        out_mode_logits = torch.where(
-            tour_mask.unsqueeze(-1).expand_as(mode_logits).bool(),
-            out_mode_logits, mode_logits
-        )
-        out_joint_logit = torch.where(tour_mask.bool(), out_joint_logit, is_joint_logit)
-        out_driver_logit = torch.where(tour_mask.bool(), out_driver_logit, is_driver_logit)
-
-        # 计算Nash福利
-        nash_welfare = self._compute_nash_welfare(
-            out_departure, out_duration, destination_logits, out_mode_logits,
-            out_joint_logit, out_driver_logit,
-            member_mask, tour_mask, home_zone, member_is_adult,
-            expected_tt, preferred_departure, preferred_duration, activity_flexibility
-        )
-
-        return NashBargainingOutput(
-            departure_time=out_departure,
-            duration=out_duration,
-            destination_logits=destination_logits,  # 目的地不变
-            mode_logits=out_mode_logits,
-            is_joint_logit=out_joint_logit,
-            is_driver_logit=out_driver_logit,
-            nash_welfare=nash_welfare,
-            converged=converged,
-        )
-
-    # =========================================================================
-    #                          变量打包/解包
-    # =========================================================================
-
-    def _pack_variables(
+    def _forward_impl(
         self,
-        departure: Tensor,      # [batch, M, T]
-        duration: Tensor,       # [batch, M, T]
-        mode_logits: Tensor,    # [batch, M, T, num_modes]
-        joint_logit: Tensor,    # [batch, M, T]
-        driver_logit: Tensor,   # [batch, M, T]
-    ) -> Tensor:
-        """打包为 [batch, total_vars]"""
-        batch_size = departure.shape[0]
-
-        # 转为概率
-        mode_prob = F.softmax(mode_logits, dim=-1)
-        joint_prob = torch.sigmoid(joint_logit)
-        driver_prob = torch.sigmoid(driver_logit)
-
-        # 拼接 [batch, M, T, vars_per_tour]
-        packed = torch.cat([
-            departure.unsqueeze(-1),
-            duration.unsqueeze(-1),
-            mode_prob,
-            joint_prob.unsqueeze(-1),
-            driver_prob.unsqueeze(-1),
-        ], dim=-1)
-
-        return packed.view(batch_size, -1)
-
-    def _unpack_variables(self, x: Tensor) -> Tuple[Tensor, ...]:
-        """解包为原始形状"""
-        batch_size = x.shape[0]
-
-        # [batch, M, T, vars_per_tour]
-        x_reshaped = x.view(batch_size, self.max_members, self.max_tours, self.vars_per_tour)
-
-        idx = 0
-        departure = x_reshaped[..., idx]; idx += 1
-        duration = x_reshaped[..., idx]; idx += 1
-        mode_prob = x_reshaped[..., idx:idx+self.num_modes]; idx += self.num_modes
-        joint_prob = x_reshaped[..., idx]; idx += 1
-        driver_prob = x_reshaped[..., idx]
-
-        # 转回logits
-        eps = 1e-6
-        mode_logits = torch.log(mode_prob.clamp(min=eps))
-        joint_logit = torch.log(joint_prob.clamp(min=eps) / (1 - joint_prob).clamp(min=eps))
-        driver_logit = torch.log(driver_prob.clamp(min=eps) / (1 - driver_prob).clamp(min=eps))
-
-        return departure, duration, mode_logits, joint_logit, driver_logit
-
-    def _build_variable_mask(self, member_mask: Tensor, tour_mask: Tensor) -> Tensor:
-        """构建变量级mask [batch, total_vars]"""
+        predictions: Dict[str, Tensor],
+        member_mask: Tensor,
+        activity_mask: Tensor,
+        num_vehicles: Tensor,
+        home_zone: Tensor,
+        member_is_adult: Tensor,
+        travel_time_matrix: Tensor,
+    ) -> Dict[str, Tensor]:
+        """Core implementation in float32."""
         batch_size = member_mask.shape[0]
         device = member_mask.device
 
-        # [batch, M, T] -> [batch, M, T, vars_per_tour] -> [batch, total_vars]
-        mask_expanded = tour_mask.unsqueeze(-1).expand(-1, -1, -1, self.vars_per_tour)
-        return mask_expanded.reshape(batch_size, -1)
+        # ---- Fixed quantities (detached, not optimized) ----
+        dest_logits = predictions['destination'].detach()
+        dest_prob = F.softmax(dest_logits, dim=-1)  # [B, M, T, Z]
 
-    def _get_home_to_zone_tt(self, home_zone: Tensor, travel_time_matrix: Tensor) -> Tensor:
-        """获取从家到各zone的出行时间 [batch, num_zones, num_modes]"""
-        batch_size = home_zone.shape[0]
+        # out_of_home_prob = 1 - P(dest == home)
+        home_idx = home_zone.long().view(-1, 1, 1, 1).expand(
+            batch_size, self.max_members, self.max_activities, 1
+        )
+        at_home_prob = dest_prob.gather(-1, home_idx).squeeze(-1)  # [B, M, T]
+        out_of_home_prob = (1 - at_home_prob).detach()
 
-        if travel_time_matrix.dim() == 3:
-            # [Z, Z, M] -> 选取 [home, :, :]
-            return travel_time_matrix[home_zone.long(), :, :]
-        else:
-            # [batch, Z, Z, M]
-            batch_idx = torch.arange(batch_size, device=home_zone.device)
-            return travel_time_matrix[batch_idx, home_zone.long(), :, :]
+        # expected travel time [B, M, T, K]
+        expected_tt = self._compute_expected_tt(
+            dest_prob, home_zone, travel_time_matrix
+        ).detach()
 
-    # =========================================================================
-    #                          效用函数计算
-    # =========================================================================
+        # ---- Pack decoder outputs ----
+        theta_packed = self._pack_from_predictions(predictions)  # [B, n] keeps grad
+        x0 = theta_packed.detach().clone()
 
-    def _compute_member_utility(
+        var_mask = self._build_var_mask(activity_mask)  # [B, n]
+
+        # ---- Phase 1: SQP (no gradient) ----
+        x_converged = self._sqp_phase(
+            x0, var_mask, member_mask, activity_mask,
+            num_vehicles, member_is_adult,
+            out_of_home_prob, expected_tt
+        )
+
+        # ---- Phase 2: OptNet (gradient through theta_packed) ----
+        x_final = self._optnet_phase(
+            x_converged, theta_packed, var_mask,
+            member_mask, activity_mask,
+            num_vehicles, member_is_adult,
+            out_of_home_prob, expected_tt
+        )
+
+        # ---- Unpack ----
+        return self._unpack_to_predictions(x_final, predictions, activity_mask)
+
+    # =====================================================================
+    #                     Variable Packing / Unpacking
+    # =====================================================================
+
+    def _pack_from_predictions(self, predictions: Dict[str, Tensor]) -> Tensor:
+        """Pack decoder outputs into flat vector [B, n].
+
+        Per activity: [start(1), end(1), mode_prob(K), joint_prob(1), driver_prob(1)]
+        """
+        start_time = predictions['continuous'][..., 0]  # [B, M, T]
+        end_time = predictions['continuous'][..., 1]    # [B, M, T]
+
+        mode_prob = F.softmax(predictions['mode'], dim=-1)              # [B, M, T, K]
+        joint_prob = F.softmax(predictions['joint'], dim=-1)[..., 1:2]  # [B, M, T, 1]
+        driver_prob = F.softmax(predictions['driver'], dim=-1)[..., 1:2]  # [B, M, T, 1]
+
+        packed = torch.cat([
+            start_time.unsqueeze(-1),
+            end_time.unsqueeze(-1),
+            mode_prob,
+            joint_prob,
+            driver_prob,
+        ], dim=-1)  # [B, M, T, vars_per_activity]
+
+        return packed.reshape(packed.shape[0], -1)  # [B, n]
+
+    def _unpack_flat(self, x: Tensor) -> dict:
+        """Unpack flat vector to named tensors."""
+        B = x.shape[0]
+        K = self.num_modes
+        x_4d = x.reshape(B, self.max_members, self.max_activities, self.vars_per_activity)
+
+        return {
+            'start_time':  x_4d[..., 0],            # [B, M, T]
+            'end_time':    x_4d[..., 1],            # [B, M, T]
+            'mode_prob':   x_4d[..., 2:2+K],        # [B, M, T, K]
+            'joint_prob':  x_4d[..., 2+K],          # [B, M, T]
+            'driver_prob': x_4d[..., 2+K+1],        # [B, M, T]
+        }
+
+    def _unpack_to_predictions(
         self,
-        departure: Tensor,      # [batch, T]
-        duration: Tensor,       # [batch, T]
-        mode_prob: Tensor,      # [batch, T, M]
-        joint_prob: Tensor,     # [batch, T]
-        driver_prob: Tensor,    # [batch, T]
-        tour_mask: Tensor,      # [batch, T]
-        is_adult: Tensor,       # [batch]
-        dest_prob: Tensor,      # [batch, T, Z]
-        home_zone: Tensor,      # [batch]
-        expected_tt: Tensor,    # [batch, Z, M]
-        pref_departure: Tensor,
-        pref_duration: Tensor,
-        flexibility: Tensor,
-    ) -> Tensor:
-        """计算单个成员的效用"""
-        batch_size = departure.shape[0]
-        device = departure.device
+        x_final: Tensor,
+        original_predictions: Dict[str, Tensor],
+        activity_mask: Tensor,
+    ) -> Dict[str, Tensor]:
+        """Convert optimized vector back to predictions dict format."""
+        unpacked = self._unpack_flat(x_final)
+        result = {k: v for k, v in original_predictions.items()}  # shallow copy
 
-        # 基准效用
-        U = torch.full((batch_size,), self.params.utility_baseline, device=device)
+        mask_3d = activity_mask.bool()   # [B, M, T]
+        mask_4d = mask_3d.unsqueeze(-1)  # [B, M, T, 1]
 
-        # 1. 位置效用：偏好外出
-        home_idx = home_zone.long().view(-1, 1, 1).expand(-1, self.max_tours, 1)
-        at_home_prob = dest_prob.gather(-1, home_idx).squeeze(-1)  # [batch, T]
-        out_of_home_prob = 1 - at_home_prob
-        U_location = self.params.alpha_social * (out_of_home_prob * tour_mask).sum(dim=-1)
+        # --- continuous ---
+        new_continuous = torch.stack([
+            unpacked['start_time'], unpacked['end_time']
+        ], dim=-1)
+        result['continuous'] = torch.where(
+            mask_4d.expand_as(new_continuous),
+            new_continuous,
+            original_predictions['continuous'],
+        )
 
-        # 2. 联合活动效用
-        U_joint = self.params.alpha_joint * (joint_prob * tour_mask).sum(dim=-1)
+        # --- mode: prob → log-prob (logits) ---
+        mode_prob_safe = unpacked['mode_prob'].clamp(min=self.eps)
+        new_mode_logits = torch.log(mode_prob_safe)
+        result['mode'] = torch.where(
+            mask_4d.expand_as(new_mode_logits),
+            new_mode_logits,
+            original_predictions['mode'],
+        )
 
-        # 3. 接送效用 (成人)
-        escort_duration = (driver_prob * duration * tour_mask).sum(dim=-1)
-        U_escort = self.params.theta_escort * escort_duration * is_adult.float()
+        # --- joint: scalar prob → 2-class log-prob ---
+        jp = unpacked['joint_prob'].clamp(self.eps, 1 - self.eps)
+        new_joint_logits = torch.stack([torch.log(1 - jp), torch.log(jp)], dim=-1)
+        result['joint'] = torch.where(
+            mask_4d.expand_as(new_joint_logits),
+            new_joint_logits,
+            original_predictions['joint'],
+        )
 
-        # 4. 时间偏差效用
-        time_deviation = (departure - pref_departure).pow(2)
-        beta = 2.0 - flexibility * 0.75  # 灵活性越高惩罚越小
-        U_timing = -self.params.beta_time * (beta * time_deviation * tour_mask).sum(dim=-1)
+        # --- driver: scalar prob → 2-class log-prob ---
+        dp = unpacked['driver_prob'].clamp(self.eps, 1 - self.eps)
+        new_driver_logits = torch.stack([torch.log(1 - dp), torch.log(dp)], dim=-1)
+        result['driver'] = torch.where(
+            mask_4d.expand_as(new_driver_logits),
+            new_driver_logits,
+            original_predictions['driver'],
+        )
 
-        # 5. 持续时间偏差效用
-        duration_deviation = (duration - pref_duration).pow(2)
-        U_duration = -self.params.gamma_duration * (duration_deviation * tour_mask).sum(dim=-1)
+        return result
 
-        # 6. 出行效用
-        # 期望出行时间: E[TT|外出] = Σ_z Σ_m dest_prob[z] * mode_prob[m] * TT[home,z,m]
-        # 简化：对于外出的tour，计算加权出行时间
-        # [batch, T, Z] @ [batch, Z, M] -> [batch, T, M]
-        expected_tt_per_tour = torch.einsum('btz,bzm->btm', dest_prob, expected_tt)
-        # [batch, T, M] * [batch, T, M] * [M] -> [batch, T]
-        travel_utility_per_tour = (mode_prob * expected_tt_per_tour * self.theta_travel).sum(dim=-1)
-        # 只有外出才有出行
-        U_travel = (out_of_home_prob * travel_utility_per_tour * tour_mask).sum(dim=-1)
+    def _build_var_mask(self, activity_mask: Tensor) -> Tensor:
+        """Build per-variable mask [B, n]."""
+        mask_expanded = activity_mask.unsqueeze(-1).expand(
+            -1, -1, -1, self.vars_per_activity
+        )
+        return mask_expanded.reshape(activity_mask.shape[0], -1)
 
-        return U + U_location + U_joint + U_escort + U_timing + U_duration + U_travel
+    # =====================================================================
+    #                     Fixed Quantity Computation
+    # =====================================================================
 
-    def _compute_household_utilities(
+    def _compute_expected_tt(
         self,
-        x: Tensor,                  # [batch, total_vars]
-        member_mask: Tensor,
-        tour_mask: Tensor,
-        member_is_adult: Tensor,
-        dest_logits: Tensor,        # [batch, M, T, Z]
+        dest_prob: Tensor,
         home_zone: Tensor,
-        expected_tt: Tensor,
-        pref_departure: Tensor,
-        pref_duration: Tensor,
-        flexibility: Tensor,
+        travel_time_matrix: Tensor,
     ) -> Tensor:
-        """计算家庭所有成员的效用 [batch, max_members]"""
-        batch_size = x.shape[0]
-        device = x.device
+        """Compute expected travel time [B, M, T, K].
 
-        departure, duration, mode_logits, joint_logit, driver_logit = self._unpack_variables(x)
-        mode_prob = F.softmax(mode_logits, dim=-1)
-        joint_prob = torch.sigmoid(joint_logit)
-        driver_prob = torch.sigmoid(driver_logit)
-        dest_prob = F.softmax(dest_logits, dim=-1)
+        dest_prob:            [B, M, T, Z]
+        travel_time_matrix:   [Z, Z] or [Z, Z, K]
+        """
+        if travel_time_matrix.dim() == 2:
+            # [Z, Z] – mode-independent travel time
+            tt_from_home = travel_time_matrix[home_zone.long()]  # [B, Z]
+            expected_tt = torch.einsum('bz,bmtz->bmt', tt_from_home, dest_prob)
+            return expected_tt.unsqueeze(-1).expand(-1, -1, -1, self.num_modes)
 
-        utilities = torch.zeros(batch_size, self.max_members, device=device)
+        elif travel_time_matrix.dim() == 3:
+            # [Z, Z, K] – mode-specific travel time
+            tt_from_home = travel_time_matrix[home_zone.long()]  # [B, Z, K]
+            return torch.einsum('bmtz,bzk->bmtk', dest_prob, tt_from_home)
 
-        for m in range(self.max_members):
-            U_m = self._compute_member_utility(
-                departure=departure[:, m, :],
-                duration=duration[:, m, :],
-                mode_prob=mode_prob[:, m, :, :],
-                joint_prob=joint_prob[:, m, :],
-                driver_prob=driver_prob[:, m, :],
-                tour_mask=tour_mask[:, m, :],
-                is_adult=member_is_adult[:, m],
-                dest_prob=dest_prob[:, m, :, :],
-                home_zone=home_zone,
-                expected_tt=expected_tt,
-                pref_departure=pref_departure[:, m, :],
-                pref_duration=pref_duration[:, m, :],
-                flexibility=flexibility[:, m, :],
+        else:
+            raise ValueError(
+                f"Unexpected travel_time_matrix dim: {travel_time_matrix.dim()}"
             )
-            utilities[:, m] = U_m
 
-        return utilities * member_mask
+    # =====================================================================
+    #                     Utility Function
+    # =====================================================================
+
+    def _compute_member_utilities(
+        self,
+        x: Tensor,               # [B, n]
+        member_mask: Tensor,      # [B, M]
+        activity_mask: Tensor,    # [B, M, T]
+        member_is_adult: Tensor,  # [B, M]
+        out_of_home_prob: Tensor, # [B, M, T]
+        expected_tt: Tensor,      # [B, M, T, K]
+    ) -> Tensor:
+        """Compute utility for each member.  Returns [B, M]."""
+        unpacked = self._unpack_flat(x)
+
+        start      = unpacked['start_time']   # [B, M, T]
+        end        = unpacked['end_time']      # [B, M, T]
+        mode_prob  = unpacked['mode_prob']     # [B, M, T, K]
+        joint_prob = unpacked['joint_prob']    # [B, M, T]
+        driver_prob = unpacked['driver_prob']  # [B, M, T]
+
+        mask = activity_mask  # [B, M, T]
+        duration = end - start  # [B, M, T]  (z-score space)
+
+        # Baseline
+        U = torch.full(
+            (x.shape[0], self.max_members),
+            self.utility_baseline,
+            device=x.device, dtype=x.dtype,
+        )
+
+        # Social utility
+        U_social = self.alpha_social * (out_of_home_prob * mask).sum(dim=-1)
+
+        # Joint utility
+        U_joint = self.alpha_joint * (joint_prob * mask).sum(dim=-1)
+
+        # Escort utility (adults only)
+        escort_time = (driver_prob * duration * mask).sum(dim=-1)
+        U_escort = self.theta_escort * escort_time * member_is_adult
+
+        # Travel utility
+        # per-trip: Σ_k mode_prob(k) * θ_travel(k) * expected_tt(k)
+        travel_per_trip = (mode_prob * expected_tt * self.theta_travel).sum(dim=-1)  # [B,M,T]
+        U_travel = (out_of_home_prob * travel_per_trip * mask).sum(dim=-1)
+
+        U_total = U + U_social + U_joint + U_escort + U_travel
+
+        # ---- Smooth lower bound (softplus): ensure U ≥ 1.0 ----
+        U_min = 1.0
+        U_total = U_total + F.softplus(U_min - U_total)
+
+        # Masked members → baseline (avoid log(0) downstream)
+        U_total = torch.where(
+            member_mask > 0,
+            U_total,
+            torch.full_like(U_total, self.utility_baseline),
+        )
+
+        return U_total  # [B, M]
 
     def _compute_nash_welfare(
-        self,
-        departure: Tensor,
-        duration: Tensor,
-        dest_logits: Tensor,
-        mode_logits: Tensor,
-        joint_logit: Tensor,
-        driver_logit: Tensor,
-        member_mask: Tensor,
-        tour_mask: Tensor,
-        home_zone: Tensor,
-        member_is_adult: Tensor,
-        expected_tt: Tensor,
-        pref_departure: Tensor,
-        pref_duration: Tensor,
-        flexibility: Tensor,
+        self, utilities: Tensor, member_mask: Tensor
     ) -> Tensor:
-        """计算Nash福利 Σ log(U_n)"""
-        x = self._pack_variables(departure, duration, mode_logits, joint_logit, driver_logit)
-        utilities = self._compute_household_utilities(
-            x, member_mask, tour_mask, member_is_adult,
-            dest_logits, home_zone, expected_tt,
-            pref_departure, pref_duration, flexibility
-        )
-        log_U = torch.log(utilities.clamp(min=1e-6))
-        return (log_U * member_mask).sum(dim=-1)
+        """Nash welfare = Σ_n log(U_n) for valid members."""
+        log_U = torch.log(utilities.clamp(min=self.eps))
+        return (log_U * member_mask).sum(dim=-1)  # [B]
 
-    # =========================================================================
-    #                          约束构建
-    # =========================================================================
+    # =====================================================================
+    #                     Phase 1: SQP (no gradient)
+    # =====================================================================
 
-    def _build_constraints(
-        self,
-        x: Tensor,              # [batch, n] 当前点
-        var_mask: Tensor,       # [batch, n]
-        member_mask: Tensor,    # [batch, M]
-        tour_mask: Tensor,      # [batch, M, T]
-        num_vehicles: Tensor,   # [batch]
-        member_is_adult: Tensor,# [batch, M]
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        构建QP约束
-
-        不等式约束 Gd <= h:
-            1. 边界约束: 0 <= x + d <= 1 (针对概率变量)
-            2. 车辆约束: Σ(driver_prob * car_mode_prob) <= num_vehicles
-
-        等式约束 Ad = b:
-            1. mode概率归一化: Σ mode_prob = 1
-
-        Returns:
-            G: [batch, num_ineq, n]
-            h: [batch, num_ineq]
-            A: [batch, num_eq, n]
-            b: [batch, num_eq]
-        """
-        batch_size = x.shape[0]
-        n = x.shape[1]
-        device = x.device
-        dtype = x.dtype
-
-        G_list = []
-        h_list = []
-        A_list = []
-        b_list = []
-
-        # ---------------------------------------------------------------------
-        # 不等式约束1: 边界约束 0 <= x + d <= 1
-        # 等价于: -x <= d 且 d <= 1 - x
-        # ---------------------------------------------------------------------
-
-        # 下界: -d <= x => -I @ d <= x
-        G_lower = -torch.eye(n, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
-        h_lower = x.clone()
-
-        # 上界: d <= 1 - x => I @ d <= 1 - x
-        G_upper = torch.eye(n, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
-        h_upper = 1 - x
-
-        # 对于时间变量(departure, duration)，设置更合理的边界
-        # departure: [0, 1], duration: [0, 0.5]
-        for m in range(self.max_members):
-            for t in range(self.max_tours):
-                base_idx = m * self.total_vars_per_member + t * self.vars_per_tour
-                # duration的上界是0.5而非1
-                duration_idx = base_idx + 1
-                h_upper[:, duration_idx] = 10 - x[:, duration_idx]
-
-                h_upper[:, base_idx] = (24-12.94601186)/ 4.69132532 - x[:, base_idx]
-
-                h_lower[:, base_idx] = x[:, base_idx] - (1 - 12.94601186) / 4.69132532
-
-        G_list.extend([G_lower, G_upper])
-        h_list.extend([h_lower, h_upper])
-
-        # ---------------------------------------------------------------------
-        # 不等式约束2: 车辆约束
-        # Σ_{m是成人} Σ_t driver_prob[m,t] * car_mode_prob[m,t] <= num_vehicles
-        #
-        # 线性化: 在当前点展开双线性项
-        # f(d,c) ≈ f(d0,c0) + (∂f/∂d)(d-d0) + (∂f/∂c)(c-c0)
-        # = d0*c0 + c0*(d-d0) + d0*(c-c0)
-        # = c0*d + d0*c - d0*c0
-        #
-        # 约束: Σ (c0*Δd + d0*Δc) <= num_vehicles - Σ d0*c0
-        # ---------------------------------------------------------------------
-
-        # 解包当前点
-        x_reshaped = x.view(batch_size, self.max_members, self.max_tours, self.vars_per_tour)
-        driver_prob_0 = x_reshaped[..., -1]  # [batch, M, T]
-        car_mode_idx = 7  # 假设car是第3个mode (index=2)
-        car_prob_0 = x_reshaped[..., 2 + car_mode_idx]  # [batch, M, T]
-
-        G_vehicle = torch.zeros(batch_size, 1, n, device=device, dtype=dtype)
-
-        for m in range(self.max_members):
-            for t in range(self.max_tours):
-                base_idx = m * self.total_vars_per_member + t * self.vars_per_tour
-                driver_idx = base_idx + 2 + self.num_modes + 1  # driver_prob位置
-                car_idx = base_idx + 2 + car_mode_idx  # car_mode_prob位置
-
-                # 系数: c0 * ∂/∂d + d0 * ∂/∂c
-                c0 = car_prob_0[:, m, t]      # [batch]
-                d0 = driver_prob_0[:, m, t]   # [batch]
-                adult_mask = member_is_adult[:, m].float()  # [batch]
-                tour_valid = tour_mask[:, m, t].float()     # [batch]
-
-                G_vehicle[:, 0, driver_idx] = c0 * adult_mask * tour_valid
-                G_vehicle[:, 0, car_idx] = d0 * adult_mask * tour_valid
-
-        # RHS: num_vehicles - Σ d0*c0
-        current_vehicle_usage = (driver_prob_0 * car_prob_0 * member_is_adult.unsqueeze(-1).float() * tour_mask).sum(dim=(1, 2))
-        h_vehicle = (num_vehicles.float() - current_vehicle_usage).unsqueeze(-1)
-
-        G_list.append(G_vehicle)
-        h_list.append(h_vehicle)
-
-        # ---------------------------------------------------------------------
-        # 等式约束: mode概率归一化
-        # Σ_m mode_prob[m] = 1 对每个有效的(member, tour)
-        #
-        # 由于初始点已经满足归一化，我们约束增量也满足: Σ Δmode_prob = 0
-        # ---------------------------------------------------------------------
-
-        num_eq = self.max_members * self.max_tours
-        A_mode = torch.zeros(batch_size, num_eq, n, device=device, dtype=dtype)
-        b_mode = torch.zeros(batch_size, num_eq, device=device, dtype=dtype)
-
-        eq_idx = 0
-        for m in range(self.max_members):
-            for t in range(self.max_tours):
-                base_idx = m * self.total_vars_per_member + t * self.vars_per_tour
-                mode_start = base_idx + 2  # mode概率起始位置
-
-                # Σ mode_prob = 1 => Σ Δmode_prob = 0
-                for mode_i in range(self.num_modes):
-                    A_mode[:, eq_idx, mode_start + mode_i] = 1.0
-
-                # b = 0 (因为是增量约束)
-                b_mode[:, eq_idx] = 0.0
-                eq_idx += 1
-
-        A_list.append(A_mode)
-        b_list.append(b_mode)
-
-        # 合并约束
-        G = torch.cat(G_list, dim=1)
-        h = torch.cat(h_list, dim=1)
-        A = torch.cat(A_list, dim=1) if A_list else torch.zeros(batch_size, 0, n, device=device, dtype=dtype)
-        b = torch.cat(b_list, dim=1) if b_list else torch.zeros(batch_size, 0, device=device, dtype=dtype)
-
-        return G, h, A, b
-
-    # =========================================================================
-    #                          SQP迭代 (阶段1)
-    # =========================================================================
-
-    def _sqp_iterations(
+    def _sqp_phase(
         self,
         x0: Tensor,
         var_mask: Tensor,
         member_mask: Tensor,
-        tour_mask: Tensor,
+        activity_mask: Tensor,
         num_vehicles: Tensor,
         member_is_adult: Tensor,
+        out_of_home_prob: Tensor,
         expected_tt: Tensor,
-        destination_logits: Tensor,
-        home_zone: Tensor,
-        pref_departure: Tensor,
-        pref_duration: Tensor,
-        flexibility: Tensor,
     ) -> Tensor:
-        """
-        SQP迭代找到收敛点
-
-        这一阶段不需要保持计算图，目的是找到一个好的收敛点
-        """
-        batch_size = x0.shape[0]
-        n = x0.shape[1]
+        """SQP iterations to find a converged point.  No gradient needed."""
+        B, n = x0.shape
         device = x0.device
-        dtype = x0.dtype
 
-        x = x0.clone().detach()
-        H = torch.eye(n, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1).clone()
+        x = x0.clone()
+        H = torch.eye(n, device=device).unsqueeze(0).expand(B, -1, -1).clone()
 
         prev_x = None
         prev_grad = None
 
         with torch.no_grad():
-            for iteration in range(self.sqp_max_iter):
-                # 计算梯度
+            for _ in range(self.sqp_max_iter):
+                # ---- gradient of Nash objective ----
                 x_var = x.clone().requires_grad_(True)
 
                 with torch.enable_grad():
-                    utilities = self._compute_household_utilities(
-                        x_var, member_mask, tour_mask, member_is_adult,
-                        destination_logits, home_zone, expected_tt,
-                        pref_departure, pref_duration, flexibility
+                    utilities = self._compute_member_utilities(
+                        x_var, member_mask, activity_mask,
+                        member_is_adult, out_of_home_prob, expected_tt,
                     )
-                    log_U = torch.log(utilities.clamp(min=1e-6))
-                    nash_obj = -(log_U * member_mask).sum(dim=-1)
+                    nash_obj = -self._compute_nash_welfare(utilities, member_mask)
                     grad = torch.autograd.grad(nash_obj.sum(), x_var)[0]
 
                 grad = grad.detach()
 
-                # 收敛检查
+                # NaN guard
+                if torch.isnan(grad).any():
+                    break
+
+                # Convergence check
                 grad_norm = (grad * var_mask).norm(dim=-1)
                 if (grad_norm < self.sqp_tol).all():
                     break
 
-                # BFGS更新Hessian近似
+                # BFGS update
                 if prev_x is not None:
                     s = x - prev_x
                     y = grad - prev_grad
@@ -664,667 +455,467 @@ class NashBargainingQPLayer(nn.Module):
                 prev_x = x.clone()
                 prev_grad = grad.clone()
 
-                # 构建约束
-                G, h, A, b = self._build_constraints(
-                    x, var_mask, member_mask, tour_mask, num_vehicles, member_is_adult
-                )
+                # Newton step (unconstrained)
+                H_reg = H + 1e-3 * torch.eye(n, device=device).unsqueeze(0)
+                try:
+                    d = -torch.linalg.solve(H_reg, grad.unsqueeze(-1)).squeeze(-1)
+                except Exception:
+                    d = -grad / (torch.diagonal(H_reg, dim1=-2, dim2=-1) + 1e-6)
 
-                # 求解带约束的QP子问题
-                d = self._solve_qp_subproblem(H, grad, G, h, A, b, var_mask)
-
-                # 线搜索
+                # Armijo line search
                 alpha = self._line_search(
-                    x, d, var_mask, member_mask, tour_mask, member_is_adult,
-                    destination_logits, home_zone, expected_tt,
-                    pref_departure, pref_duration, flexibility
+                    x, d, var_mask, member_mask, activity_mask,
+                    member_is_adult, out_of_home_prob, expected_tt,
                 )
 
-                # 更新
+                # Update & project
                 x = x + alpha * d * var_mask
                 x = self._project_to_feasible(x)
+
+                # NaN fallback → reset to x0 (SQP did 0 steps, OptNet still valid)
+                if torch.isnan(x).any():
+                    x = x0.clone()
+                    break
 
         return x
 
     def _bfgs_update(self, H: Tensor, s: Tensor, y: Tensor) -> Tensor:
-        """BFGS更新Hessian近似"""
-        batch_size = H.shape[0]
-        n = H.shape[1]
+        """BFGS Hessian approximation update with Powell's damping."""
+        B, n, _ = H.shape
         device = H.device
-        dtype = H.dtype
-
         H_new = H.clone()
 
-        for b in range(batch_size):
-            s_b = s[b]
-            y_b = y[b]
+        for b in range(B):
+            sb, yb = s[b], y[b]
 
-            # ====== 前置检查：输入有效性 ======
-            if torch.isnan(s_b).any() or torch.isinf(s_b).any():
+            # ---- Input validation ----
+            if torch.isnan(sb).any() or torch.isnan(yb).any():
                 continue
-            if torch.isnan(y_b).any() or torch.isinf(y_b).any():
+            if torch.isinf(sb).any() or torch.isinf(yb).any():
                 continue
-            if torch.isnan(H[b]).any() or torch.isinf(H[b]).any():
-                H_new[b] = torch.eye(n, device=device, dtype=dtype)
+            if sb.norm() < 1e-12 or sb.norm() > 1e6:
                 continue
-
-            # 检查步长是否太小（说明已收敛）或太大（不稳定）
-            s_norm = s_b.norm()
-            y_norm = y_b.norm()
-
-            if s_norm < 1e-12 or s_norm > 1e6:
-                continue
-            if y_norm < 1e-12 or y_norm > 1e6:
+            if yb.norm() < 1e-12 or yb.norm() > 1e6:
                 continue
 
-            # ====== 计算关键量 ======
-            sy = torch.dot(s_b, y_b)
-            Hs = H[b] @ s_b
-            sHs = torch.dot(s_b, Hs)
+            sy = torch.dot(sb, yb)
+            Hs = H[b] @ sb
+            sHs = torch.dot(sb, Hs)
 
-            # 检查 sHs 有效性
             if torch.isnan(sHs) or torch.isinf(sHs) or sHs < 1e-12:
                 continue
 
-            # ====== Powell's damping ======
+            # Powell's damping
             if sy < 0.2 * sHs:
                 theta = 0.8 * sHs / (sHs - sy + 1e-10)
-                theta = torch.clamp(theta, 0.0, 1.0)
-                y_b = theta * y_b + (1 - theta) * Hs
-                sy = torch.dot(s_b, y_b)
+                theta = theta.clamp(0.0, 1.0)
+                yb = theta * yb + (1 - theta) * Hs
+                sy = torch.dot(sb, yb)
 
-            # ====== 关键修复：sy 的下界要足够大 ======
-            # 确保 rho = 1/sy 不会太大
-            min_sy = 1e-6  # 对应 rho_max = 1e6
-            if sy < min_sy:
+            if sy < 1e-6:
                 continue
 
-            # 额外检查：rho 上界
             rho = 1.0 / sy
-            rho_max = 1e6  # 限制 rho 的最大值
-            if rho > rho_max:
+            if rho > 1e6:
                 continue
 
-            # ====== BFGS 更新 ======
-            I = torch.eye(n, device=device, dtype=dtype)
-            s_col = s_b.unsqueeze(1)
-            y_col = y_b.unsqueeze(1)
+            # BFGS rank-2 update
+            I = torch.eye(n, device=device)
+            s_col = sb.unsqueeze(1)
+            y_col = yb.unsqueeze(1)
 
-            # 计算更新项
-            # H_new = (I - rho*s*y') * H * (I - rho*y*s') + rho*s*s'
+            left  = I - rho * s_col @ y_col.T
+            right = I - rho * y_col @ s_col.T
+            H_candidate = left @ H[b] @ right + rho * s_col @ s_col.T
 
-            left_factor = I - rho * s_col @ y_col.T
-            right_factor = I - rho * y_col @ s_col.T
-            rank_one_term = rho * s_col @ s_col.T
-
-            H_candidate = left_factor @ H[b] @ right_factor + rank_one_term
-
-            # ====== 后置检查：更新结果有效性 ======
+            # ---- Output validation ----
             if torch.isnan(H_candidate).any() or torch.isinf(H_candidate).any():
-                # print(f"Warning: Invalid Hessian approximation in BFGS update, resetting to identity in batch {b}.")
-                # print(f"Number of nans: {torch.isnan(H_candidate).sum().item()}")
-                # print(f"Number of infs: {torch.isinf(H_candidate).sum().item()}")
                 continue
-
-            # 检查对角线是否为正（Hessian应该正定）
-            diag = torch.diag(H_candidate)
-            if (diag <= 0).any():
-                # 更新后不正定，保持原值
+            if (torch.diag(H_candidate) <= 0).any():
                 continue
-
-            # 检查数值范围是否合理
             if H_candidate.abs().max() > 1e8:
-                # 数值太大，保持原值
                 continue
 
             H_new[b] = H_candidate
 
         return H_new
 
-    def _solve_qp_subproblem(
-            self,
-            H: Tensor,  # [batch, n, n]
-            grad: Tensor,  # [batch, n]
-            G: Tensor,  # [batch, m, n]
-            h: Tensor,  # [batch, m]
-            A: Tensor,  # [batch, k, n]
-            b: Tensor,  # [batch, k]
-            var_mask: Tensor,
-    ) -> Tensor:
-        """
-        求解QP子问题 (SQP中间迭代用)
-
-        注意：这里不需要梯度传播，使用纯数值方法即可
-        OptNet只在最后一步使用
-        """
-        batch_size = H.shape[0]
-        n = H.shape[1]
-        device = H.device
-        dtype = H.dtype
-
-        # 正则化确保正定
-        H_reg = H + 1e-3 * torch.eye(n, device=device, dtype=dtype).unsqueeze(0)
-
-        # 方案1：无约束牛顿步 + 约束投影（简单高效）
-        try:
-            d = -torch.linalg.solve(H_reg, grad.unsqueeze(-1)).squeeze(-1)
-        except:
-            # 退化为对角近似
-            d = -grad / (torch.diagonal(H_reg, dim1=-2, dim2=-1) + 1e-6)
-
-        # 约束投影
-        d = self._project_direction_to_constraints(d, G, h, A, b)
-
-        return d
-
-    def _project_direction_to_constraints(
-            self,
-            d: Tensor,  # [batch, n]
-            G: Tensor,  # [batch, m, n]
-            h: Tensor,  # [batch, m]
-            A: Tensor,  # [batch, k, n]
-            b: Tensor,  # [batch, k]
-    ) -> Tensor:
-        """将搜索方向投影到约束可行域"""
-        batch_size = d.shape[0]
-        device = d.device
-
-        # 处理等式约束 Ad = b
-        if A.shape[1] > 0:
-            Ad = (A @ d.unsqueeze(-1)).squeeze(-1)
-            violation = Ad - b
-            try:
-                AAT = A @ A.transpose(-1, -2)
-                reg = 1e-6 * torch.eye(A.shape[1], device=device)
-                AAT_inv_viol = torch.linalg.solve(AAT + reg, violation.unsqueeze(-1))
-                correction = (A.transpose(-1, -2) @ AAT_inv_viol).squeeze(-1)
-                d = d - correction
-            except:
-                pass
-
-        # 处理不等式约束 Gd <= h
-        Gd = (G @ d.unsqueeze(-1)).squeeze(-1)  # [batch, m]
-
-        # 只关心 Gd > 0 且 Gd > h 的约束（即会违反的约束）
-        # 对于 Gd <= 0 的约束，无论 alpha 多大都满足（因为 alpha >= 0）
-        # 对于 Gd > 0 的约束，需要 alpha <= h / Gd
-
-        # 计算每个约束的最大允许步长
-        # alpha_i = h_i / Gd_i (当 Gd_i > 0 时)
-        # alpha_i = inf        (当 Gd_i <= 0 时，约束不限制步长)
-
-        eps = 1e-8
-
-        # 标记哪些约束是"活跃"的（Gd > eps）
-        active = Gd > eps  # [batch, m]
-
-        # 对于活跃约束，计算 alpha = h / Gd
-        # 对于非活跃约束，设为一个大值（不限制步长）
-        alpha_per_constraint = torch.where(
-            active,
-            h / Gd.clamp(min=eps),  # 活跃约束
-            torch.full_like(h, 1e6)  # 非活跃约束，设为大值
-        )
-
-        # 只考虑正的 alpha（负的 alpha 意味着约束在反方向，不相关）
-        alpha_per_constraint = torch.where(
-            alpha_per_constraint > 0,
-            alpha_per_constraint,
-            torch.full_like(alpha_per_constraint, 1e6)
-        )
-
-        # 取最小的 alpha（最严格的约束）
-        alpha_max, _ = alpha_per_constraint.min(dim=-1, keepdim=True)  # [batch, 1]
-
-        # 限制 alpha 在合理范围内
-        alpha_max = alpha_max.clamp(min=0.01, max=1.0)
-
-        # 检查NaN并处理
-        alpha_max = torch.where(
-            torch.isnan(alpha_max) | torch.isinf(alpha_max),
-            torch.ones_like(alpha_max) * 0.1,  # 出问题时用保守步长
-            alpha_max
-        )
-
-        # 只有当存在违反时才缩放
-        has_violation = (Gd > h + eps).any(dim=-1, keepdim=True)  # [batch, 1]
-        d = torch.where(has_violation, d * alpha_max, d)
-
-        return d
-
-    def _simple_constraint_projection(
-        self,
-        d: Tensor,
-        G: Tensor,
-        h: Tensor,
-        A: Tensor,
-        b: Tensor,
-    ) -> Tensor:
-        """简单的约束投影"""
-        # 检查不等式约束违反
-        Gd = (G @ d.unsqueeze(-1)).squeeze(-1)
-        violations = (Gd - h).clamp(min=0)
-        max_violation = violations.max(dim=-1, keepdim=True)[0]
-
-        # 如果违反，缩放步长
-        if max_violation.max() > 1e-6:
-            scale = 1.0 / (1.0 + max_violation)
-            d = d * scale
-
-        return d
-
     def _line_search(
-        self,
-        x: Tensor,
-        d: Tensor,
-        var_mask: Tensor,
-        member_mask: Tensor,
-        tour_mask: Tensor,
-        member_is_adult: Tensor,
-        destination_logits: Tensor,
-        home_zone: Tensor,
-        expected_tt: Tensor,
-        pref_departure: Tensor,
-        pref_duration: Tensor,
-        flexibility: Tensor,
+        self, x, d, var_mask, member_mask, activity_mask,
+        member_is_adult, out_of_home_prob, expected_tt,
     ) -> Tensor:
-        """简单的回溯线搜索"""
-        batch_size = x.shape[0]
+        """Armijo backtracking line search."""
+        B = x.shape[0]
         device = x.device
 
-        # 计算当前目标值
-        utilities = self._compute_household_utilities(
-            x, member_mask, tour_mask, member_is_adult,
-            destination_logits, home_zone, expected_tt,
-            pref_departure, pref_duration, flexibility
+        utilities = self._compute_member_utilities(
+            x, member_mask, activity_mask, member_is_adult,
+            out_of_home_prob, expected_tt,
         )
-        log_U = torch.log(utilities.clamp(min=1e-6))
-        f0 = -(log_U * member_mask).sum(dim=-1)
+        f0 = -self._compute_nash_welfare(utilities, member_mask)
 
-        alpha = torch.ones(batch_size, device=device)
+        alpha = torch.ones(B, 1, device=device)
 
         for _ in range(10):
-            x_new = x + alpha.unsqueeze(-1) * d * var_mask
-            x_new = self._project_to_feasible(x_new)
-
-            utilities_new = self._compute_household_utilities(
-                x_new, member_mask, tour_mask, member_is_adult,
-                destination_logits, home_zone, expected_tt,
-                pref_departure, pref_duration, flexibility
+            x_new = self._project_to_feasible(x + alpha * d * var_mask)
+            utils_new = self._compute_member_utilities(
+                x_new, member_mask, activity_mask, member_is_adult,
+                out_of_home_prob, expected_tt,
             )
-            log_U_new = torch.log(utilities_new.clamp(min=1e-6))
-            f_new = -(log_U_new * member_mask).sum(dim=-1)
+            f_new = -self._compute_nash_welfare(utils_new, member_mask)
 
-            # Armijo条件
-            improved = f_new < f0 - 1e-4 * alpha * (d * var_mask).pow(2).sum(dim=-1)
-
-            if improved.all():
+            sufficient_decrease = (
+                f_new < f0 - 1e-4 * alpha.squeeze(-1) * (d * var_mask).pow(2).sum(dim=-1)
+            )
+            if sufficient_decrease.all():
                 break
+            alpha = torch.where(sufficient_decrease.unsqueeze(-1), alpha, alpha * 0.5)
 
-            alpha = torch.where(improved, alpha, alpha * 0.5)
-
-        return alpha.unsqueeze(-1)
+        return alpha
 
     def _project_to_feasible(self, x: Tensor) -> Tensor:
-        """投影到可行域"""
-        batch_size = x.shape[0]
+        """Project to feasible region (bounds + simplex + ordering)."""
+        B = x.shape[0]
+        K = self.num_modes
+        x_4d = x.reshape(B, self.max_members, self.max_activities, self.vars_per_activity)
 
-        x_reshaped = x.view(batch_size, self.max_members, self.max_tours, self.vars_per_tour)
+        # Time bounds
+        start = x_4d[..., 0].clamp(self.z_min, self.z_max)
+        end   = x_4d[..., 1].clamp(self.z_min, self.z_max)
+        # Ensure end >= start
+        end = torch.maximum(end, start + 0.01)
+        end = end.clamp(max=self.z_max)
 
-        # 边界投影
-        departure = x_reshaped[..., 0].clamp(0, 1)
-        duration = x_reshaped[..., 1].clamp(0, 0.5)
-
-        # mode概率归一化
-        mode_prob = x_reshaped[..., 2:2+self.num_modes]
-        mode_prob = mode_prob.clamp(min=1e-6)
+        # Mode probability simplex
+        mode_prob = x_4d[..., 2:2+K].clamp(min=self.eps)
         mode_prob = mode_prob / mode_prob.sum(dim=-1, keepdim=True)
 
-        # joint/driver概率边界
-        joint_prob = x_reshaped[..., 2+self.num_modes].clamp(1e-6, 1-1e-6)
-        driver_prob = x_reshaped[..., 2+self.num_modes+1].clamp(1e-6, 1-1e-6)
+        # Probability bounds
+        joint_prob  = x_4d[..., 2+K].clamp(self.eps, 1 - self.eps)
+        driver_prob = x_4d[..., 2+K+1].clamp(self.eps, 1 - self.eps)
 
-        # 重新组装
-        x_projected = torch.cat([
-            departure.unsqueeze(-1),
-            duration.unsqueeze(-1),
+        x_proj = torch.cat([
+            start.unsqueeze(-1),
+            end.unsqueeze(-1),
             mode_prob,
             joint_prob.unsqueeze(-1),
             driver_prob.unsqueeze(-1),
         ], dim=-1)
 
-        return x_projected.view(batch_size, -1)
+        return x_proj.reshape(B, -1)
 
-    # =========================================================================
-    #                          最终OptNet步 (阶段2)
-    # =========================================================================
+    # =====================================================================
+    #                     Phase 2: OptNet (with gradient)
+    # =====================================================================
 
-    def _final_optnet_step(
+    def _optnet_phase(
         self,
-        x_converged: Tensor,            # SQP收敛点 (detached)
-        theta_departure: Tensor,        # 原始神经网络输出 (保持计算图)
-        theta_duration: Tensor,
-        theta_mode_logits: Tensor,
-        theta_joint_logit: Tensor,
-        theta_driver_logit: Tensor,
-        theta_destination_logits: Tensor,
+        x_converged: Tensor,     # [B, n]  detached
+        theta_packed: Tensor,     # [B, n]  with grad
         var_mask: Tensor,
         member_mask: Tensor,
-        tour_mask: Tensor,
+        activity_mask: Tensor,
         num_vehicles: Tensor,
         member_is_adult: Tensor,
+        out_of_home_prob: Tensor,
         expected_tt: Tensor,
-        home_zone: Tensor,
-        pref_departure: Tensor,
-        pref_duration: Tensor,
-        flexibility: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        最终OptNet步：基于收敛点和原始θ构建QP，实现梯度传播
+    ) -> Tensor:
+        """OptNet phase: solve QP with gradient through θ_packed.
 
-        关键设计：
-        - Q, p 显式依赖 θ (神经网络输出)
-        - G, h, A, b 基于收敛点构建约束
-        - OptNet通过KKT条件计算 dx*/dθ
+        QP:  min  0.5 d^T Q d + p^T d   s.t.  G d ≤ h,  A d = b
+
+        Q = Q_nash_diag(detached) + λ_anchor · I
+        p = g_nash(detached, ≈0 at converged) + λ_anchor · (x_conv.detach() − θ_packed)
+
+        θ_packed keeps computation graph → p depends on θ → OptNet 通过 KKT 传梯度.
         """
-        batch_size = x_converged.shape[0]
-        n = x_converged.shape[1]
+        B, n = x_converged.shape
         device = x_converged.device
-        dtype = x_converged.dtype
 
-        # -----------------------------------------------------------------
-        # 构建QP参数，使其显式依赖θ
-        #
-        # 目标函数: min -Σ log(U_n)
-        # 在收敛点x*做二阶展开:
-        #   f(x) ≈ f(x*) + g^T(x-x*) + 0.5*(x-x*)^T H (x-x*)
-        #
-        # 令 d = x - x*，QP子问题:
-        #   min 0.5 * d^T Q d + p^T d
-        # 其中:
-        #   Q = ∂²f/∂x² (Hessian)
-        #   p = ∂f/∂x   (梯度)
-        #
-        # 关键：p 和 Q 需要依赖 θ
-        # -----------------------------------------------------------------
+        # ---- Utility values at converged point (for Q_nash_diag) ----
+        utilities = self._compute_member_utilities(
+            x_converged, member_mask, activity_mask,
+            member_is_adult, out_of_home_prob, expected_tt,
+        )  # [B, M]
 
-        # 打包θ为向量 (保持计算图)
-        theta_x = self._pack_variables(
-            theta_departure, theta_duration,
-            theta_mode_logits, theta_joint_logit, theta_driver_logit
+        inv_U    = (1.0 / utilities.clamp(min=1.0)).detach()   # [B, M]
+        inv_U_sq = (inv_U ** 2).detach()                        # [B, M]
+
+        # Expand to per-variable dimension
+        inv_U_sq_expanded = inv_U_sq.unsqueeze(-1).unsqueeze(-1).expand(
+            -1, -1, self.max_activities, self.vars_per_activity
+        ).reshape(B, n)
+
+        # ---- Q = diag(1/U_n²) + λ I ----
+        Q_diag = inv_U_sq_expanded + self.lambda_anchor
+        Q = torch.diag_embed(Q_diag)  # [B, n, n]
+
+        # ---- p = λ (x_conv − θ)  (g_nash ≈ 0 at converged point) ----
+        p = self.lambda_anchor * (x_converged.detach() - theta_packed)  # depends on θ!
+
+        # ---- Constraints ----
+        G, h, A, b = self._build_optnet_constraints(
+            x_converged, var_mask, member_mask, activity_mask,
+            num_vehicles, member_is_adult,
         )
 
-        # 计算在收敛点的梯度和Hessian，但表达式中包含θ
-        #
-        # 设计：效用函数 U_n(x; θ) 包含偏好项 -β||x - θ||²
-        # 这使得 ∂U/∂θ ≠ 0，从而 p 依赖 θ
-
-        Q, p = self._build_qp_objective_with_theta(
-            x_converged=x_converged,
-            theta_x=theta_x,
-            theta_destination_logits=theta_destination_logits,
-            member_mask=member_mask,
-            tour_mask=tour_mask,
-            member_is_adult=member_is_adult,
-            expected_tt=expected_tt,
-            home_zone=home_zone,
-            flexibility=flexibility,
-        )
-
-        # 构建约束 (基于收敛点)
-        G, h, A, b = self._build_constraints(
-            x_converged, var_mask, member_mask, tour_mask, num_vehicles, member_is_adult
-        )
-
-        # 正则化Q确保正定
-        Q = Q + 1e-3 * torch.eye(n, device=device, dtype=dtype).unsqueeze(0)
-
-        assert not torch.isnan(Q).any(), "Q contains NaN"
-        assert not torch.isnan(p).any(), "p contains NaN"
-
-        # OptNet求解
-        converged = torch.ones(batch_size, dtype=torch.bool, device=device)
-
-        if QPTH_AVAILABLE:
-            try:
-                d = QPFunction(verbose=False, maxIter=100, eps=1e-6)(
+        # ---- Solve QP ----
+        try:
+            if QPTH_AVAILABLE:
+                d_star = QPFunction(verbose=False, maxIter=100, eps=1e-6)(
                     Q.double(), p.double(),
                     G.double(), h.double(),
-                    A.double(), b.double()
+                    A.double(), b.double(),
                 ).float()
-            except Exception as e:
-                print(f"OptNet failed: {e}, using fallback")
-                d = self._fallback_qp_solve(Q, p, G, h, A, b)
-                converged = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        else:
-            d = self._fallback_qp_solve(Q, p, G, h, A, b)
+            else:
+                d_star = self._fallback_qp_solve(Q, p, G, h, A, b)
+        except Exception as e:
+            # Fallback: d* = 0  →  Nash layer ≡ identity, gradient still flows
+            d_star = torch.zeros_like(theta_packed)
 
-        # x_final = x_converged + d
-        # 但我们需要保持与θ的连接
-        # 技巧：x_final = theta_x + (x_converged - theta_x).detach() + d
-        # 这样 x_final 依赖 theta_x 和 d (后者通过OptNet依赖θ)
+        # NaN fallback
+        if torch.isnan(d_star).any():
+            d_star = torch.zeros_like(theta_packed)
 
-        x_final = theta_x + (x_converged - theta_x.detach()) + d
+        # ---- x_final = θ + (x_conv − θ).detach() + d* ----
+        x_final = theta_packed + (x_converged - theta_packed).detach() + d_star
         x_final = self._project_to_feasible(x_final)
 
-        return x_final, converged
+        return x_final
 
-    def _build_qp_objective_with_theta(
+    # =====================================================================
+    #                     Constraint Building (Phase 2)
+    # =====================================================================
+
+    def _build_optnet_constraints(
         self,
-        x_converged: Tensor,            # [batch, n]
-        theta_x: Tensor,                # [batch, n] 打包后的神经网络输出
-        theta_destination_logits: Tensor,
-        member_mask: Tensor,
-        tour_mask: Tensor,
-        member_is_adult: Tensor,
-        expected_tt: Tensor,
-        home_zone: Tensor,
-        flexibility: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+        x_conv: Tensor,          # [B, n]
+        var_mask: Tensor,         # [B, n]
+        member_mask: Tensor,      # [B, M]
+        activity_mask: Tensor,    # [B, M, T]
+        num_vehicles: Tensor,     # [B]
+        member_is_adult: Tensor,  # [B, M]
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Build QP constraints:  G d ≤ h,  A d = b.
+
+        Inequality (G d ≤ h):
+            1. Bound constraints
+            2. Time ordering constraints
+            3. Vehicle constraint (linearised bilinear)
+
+        Equality (A d = b):
+            4. Mode probability normalisation  Σ Δmode_prob = 0
+            5. Joint travel consistency  (conditional)
         """
-        构建依赖θ的QP目标函数参数
+        B, n = x_conv.shape
+        device = x_conv.device
+        M = self.max_members
+        T = self.max_activities
+        K = self.num_modes
+        V = self.vars_per_activity
 
-        核心思路：
-        效用函数 U_n = U_n^base(x) - β||x - θ||² (偏好接近神经网络输出)
+        G_list: list[Tensor] = []
+        h_list: list[Tensor] = []
+        A_list: list[Tensor] = []
+        b_list: list[Tensor] = []
 
-        Nash目标: f(x) = -Σ log(U_n)
+        I_n = torch.eye(n, device=device).unsqueeze(0).expand(B, -1, -1)
 
-        在x*处展开:
-        f(x) ≈ f(x*) + p^T(x-x*) + 0.5*(x-x*)^T Q (x-x*)
+        # ---- 1. Bound constraints ----
+        lb = torch.full((B, n), self.eps, device=device)
+        ub = torch.full((B, n), 1 - self.eps, device=device)
 
-        其中:
-        p = ∂f/∂x|_{x*} = -Σ (1/U_n) * ∂U_n/∂x|_{x*}
-        Q = ∂²f/∂x²|_{x*}  (近似为对角阵)
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                lb[:, base]     = self.z_min   # start lb
+                ub[:, base]     = self.z_max   # start ub
+                lb[:, base + 1] = self.z_min   # end lb
+                ub[:, base + 1] = self.z_max   # end ub
 
-        关键：∂U_n/∂x 包含 -2β(x - θ) 项，使得 p 依赖 θ
-        """
-        batch_size = x_converged.shape[0]
-        n = x_converged.shape[1]
-        device = x_converged.device
-        dtype = x_converged.dtype
+        # -I d ≤ x_conv − lb   (lower bound)
+        G_list.append(-I_n)
+        h_list.append(x_conv - lb)
+        #  I d ≤ ub − x_conv   (upper bound)
+        G_list.append(I_n)
+        h_list.append(ub - x_conv)
 
-        # 计算收敛点的效用
-        utilities = self._compute_household_utilities(
-            x_converged, member_mask, tour_mask, member_is_adult,
-            theta_destination_logits.detach(), home_zone, expected_tt,
-            theta_x[:, :self.max_members * self.max_tours].view(batch_size, self.max_members, self.max_tours),  # departure作为偏好
-            theta_x[:, self.max_members * self.max_tours:2*self.max_members * self.max_tours].view(batch_size, self.max_members, self.max_tours),  # duration作为偏好
-            flexibility
+        # ---- 2. Time ordering constraints ----
+        time_G_rows: list[Tensor] = []
+        time_h_vals: list[Tensor] = []
+
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                si = base       # start index
+                ei = base + 1   # end index
+
+                # end ≥ start  →  d[start] − d[end] ≤ x_conv[end] − x_conv[start]
+                row = torch.zeros(B, n, device=device)
+                row[:, si] =  1.0
+                row[:, ei] = -1.0
+                time_G_rows.append(row)
+                time_h_vals.append(x_conv[:, ei] - x_conv[:, si])
+
+                # start(t+1) ≥ end(t)
+                if t < T - 1:
+                    next_si = m * self.vars_per_member + (t + 1) * V
+                    row2 = torch.zeros(B, n, device=device)
+                    row2[:, ei]      =  1.0
+                    row2[:, next_si] = -1.0
+                    time_G_rows.append(row2)
+                    time_h_vals.append(x_conv[:, next_si] - x_conv[:, ei])
+
+        if time_G_rows:
+            G_list.append(torch.stack(time_G_rows, dim=1))
+            h_list.append(torch.stack(time_h_vals, dim=1))
+
+        # ---- 3. Vehicle constraint (linearised bilinear) ----
+        x_4d = x_conv.reshape(B, M, T, V)
+        driver_p0 = x_4d[..., 2 + K + 1]                        # [B, M, T]
+        car_idx   = self.car_mode_indices[0]
+        car_p0    = x_4d[..., 2 + car_idx]                       # [B, M, T]
+
+        G_veh = torch.zeros(B, 1, n, device=device)
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                drv_vi = base + 2 + K + 1
+                car_vi = base + 2 + car_idx
+
+                c0    = car_p0[:, m, t]
+                d0    = driver_p0[:, m, t]
+                adult = member_is_adult[:, m]
+                valid = activity_mask[:, m, t]
+
+                G_veh[:, 0, drv_vi] = c0 * adult * valid
+                G_veh[:, 0, car_vi] = d0 * adult * valid
+
+        current_usage = (
+            driver_p0 * car_p0 * member_is_adult.unsqueeze(-1) * activity_mask
+        ).sum(dim=(1, 2))
+        h_veh = (num_vehicles - current_usage).unsqueeze(-1)
+
+        G_list.append(G_veh)
+        h_list.append(h_veh)
+
+        # ---- 4. Mode probability normalisation (equality) ----
+        num_eq_mode = M * T
+        A_mode = torch.zeros(B, num_eq_mode, n, device=device)
+        b_mode = torch.zeros(B, num_eq_mode, device=device)
+
+        eq_idx = 0
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                for k in range(K):
+                    A_mode[:, eq_idx, base + 2 + k] = 1.0
+                b_mode[:, eq_idx] = 0.0   # Σ Δmode_prob = 0
+                eq_idx += 1
+
+        A_list.append(A_mode)
+        b_list.append(b_mode)
+
+        # ---- 5. Joint travel consistency (equality, conditional) ----
+        joint_prob_conv = x_4d[..., 2 + K]   # [B, M, T]
+
+        joint_A_rows: list[Tensor] = []
+        joint_b_vals: list[Tensor] = []
+
+        for t in range(T):
+            for m1 in range(M):
+                for m2 in range(m1 + 1, M):
+                    jp_prod = joint_prob_conv[:, m1, t] * joint_prob_conv[:, m2, t]
+                    active = (jp_prod > self.joint_consistency_threshold).float()  # [B]
+
+                    if active.sum() == 0:
+                        continue
+
+                    base_m1 = m1 * self.vars_per_member + t * V
+                    base_m2 = m2 * self.vars_per_member + t * V
+
+                    # start(m1) = start(m2)
+                    row_s = torch.zeros(B, n, device=device)
+                    row_s[:, base_m1]     =  active
+                    row_s[:, base_m2]     = -active
+                    joint_A_rows.append(row_s)
+                    joint_b_vals.append(active * (x_conv[:, base_m2] - x_conv[:, base_m1]))
+
+                    # end(m1) = end(m2)
+                    row_e = torch.zeros(B, n, device=device)
+                    row_e[:, base_m1 + 1] =  active
+                    row_e[:, base_m2 + 1] = -active
+                    joint_A_rows.append(row_e)
+                    joint_b_vals.append(
+                        active * (x_conv[:, base_m2 + 1] - x_conv[:, base_m1 + 1])
+                    )
+
+                    # mode_prob(m1,t,k) = mode_prob(m2,t,k) for each k
+                    for k in range(K):
+                        row_mk = torch.zeros(B, n, device=device)
+                        row_mk[:, base_m1 + 2 + k] =  active
+                        row_mk[:, base_m2 + 2 + k] = -active
+                        joint_A_rows.append(row_mk)
+                        joint_b_vals.append(
+                            active * (
+                                x_conv[:, base_m2 + 2 + k]
+                                - x_conv[:, base_m1 + 2 + k]
+                            )
+                        )
+
+        if joint_A_rows:
+            A_list.append(torch.stack(joint_A_rows, dim=1))
+            b_list.append(torch.stack(joint_b_vals, dim=1))
+
+        # ---- Combine ----
+        G = torch.cat(G_list, dim=1)
+        h = torch.cat(h_list, dim=1)
+        A = (
+            torch.cat(A_list, dim=1)
+            if A_list
+            else torch.zeros(B, 0, n, device=device)
+        )
+        b = (
+            torch.cat(b_list, dim=1)
+            if b_list
+            else torch.zeros(B, 0, device=device)
         )
 
-        # 效用的倒数 [batch, M]
-        inv_U = 1.0 / utilities.clamp(min=1e-6)  # [batch, M]
+        return G, h, A, b
 
-        # -----------------------------------------------------------------
-        # 构建p (梯度)
-        #
-        # p_i = -Σ_n (1/U_n) * ∂U_n/∂x_i
-        #
-        # 偏好惩罚项贡献: -2β(x_i - θ_i)
-        # 所以 ∂U_n/∂x_i 中包含 -2β (针对与成员n相关的变量)
-        #
-        # 简化：p ≈ -2β * Σ_n (1/U_n) * (x - θ) 对成员n的变量
-        # -----------------------------------------------------------------
-
-        beta = 2.0  # 偏好权重
-
-        # 将inv_U扩展到变量维度
-        # [batch, M] -> [batch, M, T, vars_per_tour] -> [batch, n]
-        inv_U_expanded = inv_U.unsqueeze(-1).unsqueeze(-1)
-        inv_U_expanded = inv_U_expanded.expand(-1, -1, self.max_tours, self.vars_per_tour)
-        inv_U_flat = inv_U_expanded.reshape(batch_size, n)
-
-        # p = -2β * inv_U * (x_converged - theta_x)
-        # 注意：这里theta_x保持计算图
-        p = -2 * beta * inv_U_flat * (x_converged.detach() - theta_x)
-
-        # -----------------------------------------------------------------
-        # 构建Q (Hessian近似)
-        #
-        # 简化为对角阵：Q_ii = 2β * Σ_n (1/U_n²) (如果变量i属于成员n)
-        # -----------------------------------------------------------------
-
-        inv_U_sq = 1.0 / (utilities.clamp(min=1e-6) ** 2)
-        inv_U_sq_expanded = inv_U_sq.unsqueeze(-1).unsqueeze(-1)
-        inv_U_sq_expanded = inv_U_sq_expanded.expand(-1, -1, self.max_tours, self.vars_per_tour)
-        inv_U_sq_flat = inv_U_sq_expanded.reshape(batch_size, n)
-
-        # Q为对角阵
-        Q_diag = 2 * beta * inv_U_sq_flat
-        Q = torch.diag_embed(Q_diag)
-
-        return Q, p
+    # =====================================================================
+    #                     Fallback QP Solver
+    # =====================================================================
 
     def _fallback_qp_solve(
-        self,
-        Q: Tensor,
-        p: Tensor,
-        G: Tensor,
-        h: Tensor,
-        A: Tensor,
-        b: Tensor,
+        self, Q: Tensor, p: Tensor, G: Tensor, h: Tensor, A: Tensor, b: Tensor,
     ) -> Tensor:
-        """备选QP求解"""
+        """Fallback QP solver when qpth is unavailable."""
         try:
             d = -torch.linalg.solve(Q, p.unsqueeze(-1)).squeeze(-1)
-        except:
+        except Exception:
             d = -p / (torch.diagonal(Q, dim1=-2, dim2=-1) + 1e-6)
-
-        d = self._simple_constraint_projection(d, G, h, A, b)
         return d
 
 
 # =============================================================================
-#                    包装类：便于集成到现有模型
+#                     Factory Function
 # =============================================================================
 
-class HouseholdNashBargainingLayer(nn.Module):
-    """
-    家庭Nash Bargaining协调层 - 便于集成的包装类
-    """
-
-    def __init__(
-        self,
-        num_zones: int,
-        num_modes: int = 4,
-        max_members: int = 6,
-        max_tours: int = 8,
-        utility_params: Optional[UtilityParams] = None,
-        sqp_max_iter: int = 10,
-        sqp_tol: float = 1e-4,
-        enabled: bool = True,
-    ):
-        super().__init__()
-
-        self.enabled = enabled
-
-        self.nash_qp_layer = NashBargainingQPLayer(
-            num_zones=num_zones,
-            num_modes=num_modes,
-            max_members=max_members,
-            max_tours=max_tours,
-            utility_params=utility_params,
-            sqp_max_iter=sqp_max_iter,
-            sqp_tol=sqp_tol,
-        )
-
-    def forward(
-        self,
-        departure_time: Tensor,
-        duration: Tensor,
-        destination_logits: Tensor,
-        mode_logits: Tensor,
-        is_joint_logit: Tensor,
-        is_driver_logit: Tensor,
-        member_mask: Tensor,
-        tour_mask: Tensor,
-        num_vehicles: Tensor,
-        home_zone: Tensor,
-        member_is_adult: Tensor,
-        travel_time_matrix: Tensor,
-        preferred_departure: Optional[Tensor] = None,
-        preferred_duration: Optional[Tensor] = None,
-        activity_flexibility: Optional[Tensor] = None,
-    ) -> NashBargainingOutput:
-        """前向传播"""
-        if not self.enabled:
-            return NashBargainingOutput(
-                departure_time=departure_time,
-                duration=duration,
-                destination_logits=destination_logits,
-                mode_logits=mode_logits,
-                is_joint_logit=is_joint_logit,
-                is_driver_logit=is_driver_logit,
-                nash_welfare=torch.zeros(departure_time.shape[0], device=departure_time.device),
-                converged=torch.ones(departure_time.shape[0], dtype=torch.bool, device=departure_time.device),
-            )
-
-        return self.nash_qp_layer(
-            departure_time=departure_time,
-            duration=duration,
-            destination_logits=destination_logits,
-            mode_logits=mode_logits,
-            is_joint_logit=is_joint_logit,
-            is_driver_logit=is_driver_logit,
-            member_mask=member_mask,
-            tour_mask=tour_mask,
-            num_vehicles=num_vehicles,
-            home_zone=home_zone,
-            member_is_adult=member_is_adult,
-            travel_time_matrix=travel_time_matrix,
-            preferred_departure=preferred_departure,
-            preferred_duration=preferred_duration,
-            activity_flexibility=activity_flexibility,
-        )
-
-    def set_enabled(self, enabled: bool):
-        """动态开启/关闭协调层"""
-        self.enabled = enabled
-
-
-# =============================================================================
-#                    工具函数
-# =============================================================================
-
-def create_nash_layer_from_config(config: dict) -> HouseholdNashBargainingLayer:
-    """从配置创建Nash层"""
-    utility_params = UtilityParams(
-        alpha_joint=config.get('alpha_joint', 0.1),
-        alpha_social=config.get('alpha_social', 0.3),
-        theta_escort=config.get('theta_escort', -0.58),
-        theta_car=config.get('theta_car', -1.0),
-        theta_pt=config.get('theta_pt', -0.4),
-        beta_time=config.get('beta_time', 1.0),
-        gamma_duration=config.get('gamma_duration', 1.0),
-        utility_baseline=config.get('utility_baseline', 10.0),
-    )
-
-    return HouseholdNashBargainingLayer(
-        num_zones=config['num_zones'],
-        num_modes=config.get('num_modes', 4),
-        max_members=config.get('max_members', 6),
-        max_tours=config.get('max_tours', 8),
-        utility_params=utility_params,
-        sqp_max_iter=config.get('sqp_max_iter', 10),
-        sqp_tol=config.get('sqp_tol', 1e-4),
-        enabled=config.get('enabled', True),
+def create_nash_layer_from_config(config) -> NashBargainingSQPOptNet:
+    """Create Nash layer from model config."""
+    nc = config.nash_config
+    return NashBargainingSQPOptNet(
+        num_modes=nc.get('num_modes', 11),
+        max_members=config.max_members,
+        max_activities=config.max_activities,
+        alpha_joint=nc.get('alpha_joint', 0.1),
+        alpha_social=nc.get('alpha_social', 0.3),
+        theta_escort=nc.get('theta_escort', -0.58),
+        utility_baseline=nc.get('utility_baseline', 10.0),
+        lambda_anchor=nc.get('lambda_anchor', 0.1),
+        joint_consistency_threshold=nc.get('joint_consistency_threshold', 0.5),
+        car_mode_indices=nc.get('car_mode_indices', [7]),
+        sqp_max_iter=nc.get('sqp_max_iter', 15),
+        sqp_tol=nc.get('sqp_tol', 1e-4),
     )

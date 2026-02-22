@@ -73,10 +73,12 @@ class ModelConfig:
         'alpha_joint': 0.1,
         'alpha_social': 0.3,
         'theta_escort': -0.58,
-        'theta_car': -1.0,
-        'theta_pt': -0.4,
+        'utility_baseline': 10.0,
         'sqp_max_iter': 15,
         'sqp_tol': 1e-4,
+        'lambda_anchor': 0.1,
+        'joint_consistency_threshold': 0.5,
+        'car_mode_indices': [7],
     })
     nash_bargaining_start_epoch: int = 20  # 从第几个epoch开始使用Nash Bargaining
 
