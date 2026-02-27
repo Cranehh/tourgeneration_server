@@ -693,6 +693,7 @@ class ExposureBiasTrainer:
         # 更新调度器
         self.ss_scheduler.step()
         loss = loss + ar_ratio * ar_loss
+
         return loss, losses
     
     def get_current_tf_prob(self) -> float:

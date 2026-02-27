@@ -115,11 +115,34 @@ class ScheduledSamplingTrainer:
                         batch, self.criterion, self.optimizer, self.current_epoch
                     )
 
-                self.scaler.scale(loss).backward()
+                # ---- NaN detection: forward pass ----
+                if torch.isnan(loss):
+                    print(f"\n[NaN DEBUG] loss is NaN at epoch={self.current_epoch}, "
+                          f"step={self.global_step}, batch={num_batches}")
+                    for k, v in losses.items():
+                        if torch.is_tensor(v) and torch.isnan(v):
+                            print(f"  loss component '{k}' is NaN")
+                    print(f"  AMP scaler scale={self.scaler.get_scale():.4f}")
+
+                try:
+                    self.scaler.scale(loss).backward()
+                except RuntimeError as e:
+                    # Safety net: catch backward LU errors from qpth KKT
+                    print(f"\n[NaN DEBUG] backward failed at epoch={self.current_epoch}, "
+                          f"step={self.global_step}: {e}")
+                    self.optimizer.zero_grad()
+                    # Skip scaler.update() — no inf checks recorded, calling update would assert
+                    continue
+
+                # ---- NaN detection: gradients ----
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.train_config.grad_clip
                 )
+                if torch.isnan(total_grad_norm) or total_grad_norm > 1e6:
+                    print(f"\n[NaN DEBUG] grad_norm={total_grad_norm:.4f} at epoch={self.current_epoch}, "
+                          f"step={self.global_step}")
+
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -149,6 +172,10 @@ class ScheduledSamplingTrainer:
             })
 
         self.scheduler.step()
+
+        # Release fragmented GPU memory at end of each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         avg_loss = total_loss / num_batches
         avg_components = {k: v / num_batches for k, v in loss_components.items()}
@@ -288,33 +315,46 @@ class ScheduledSamplingTrainer:
         logger.info(f"Starting training with Scheduled Sampling on {self.device}")
         logger.info(f"Model parameters: {self.model.count_parameters()}")
 
+        nan_loss_count = 0  # 连续NaN计数
+        report_interval = 5  # 每5个epoch输出详细状态
+
         for epoch in range(self.train_config.num_epochs):
             self.current_epoch = epoch
             # 训练
             train_metrics = self.train_epoch()
             tf_prob = self.eb_trainer.get_current_tf_prob()
 
+            # NaN 监控: 如果连续3个epoch出现NaN loss，停止训练
+            if train_metrics['total'] != train_metrics['total']:  # NaN check
+                nan_loss_count += 1
+                logger.warning(f"Epoch {epoch} - Train Loss is NaN! (consecutive: {nan_loss_count})")
+                if nan_loss_count >= 3:
+                    logger.error("3 consecutive NaN epochs, stopping training!")
+                    break
+            else:
+                nan_loss_count = 0
+
             logger.info(
                 f"Epoch {epoch} - Loss: {train_metrics['total']:.4f}, "
                 f"TF Prob: {tf_prob:.3f}"
             )
 
-            # 验证
-            if (epoch + 1) % 1 == 0:
-                val_metrics = self.validate(epoch)
-                if val_metrics:
-                    logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['val_total']:.4f} - TF Val Loss: {val_metrics['val_total_tf']:.4f}")
+            # 每个epoch都做验证（与保存最佳模型相关）
+            val_metrics = self.validate(epoch)
+            if val_metrics:
+                logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['val_total']:.4f} - TF Val Loss: {val_metrics['val_total_tf']:.4f}")
 
-                    # 打印生成准确率
+                # 每 report_interval 个 epoch 输出详细指标
+                if epoch == 0 or (epoch + 1) % report_interval == 0:
                     for k, v in val_metrics.items():
                         if 'gen_acc' in k:
                             logger.info(f"  {k}: {v:.4f}")
 
-                    # 保存最佳
-                    if val_metrics['val_total'] < self.best_val_loss:
-                        self.best_val_loss = val_metrics['val_total']
-                        self.save_checkpoint('best_model.pt')
-                        logger.info("  New best model saved!")
+                # 保存最佳
+                if val_metrics['val_total'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['val_total']
+                    self.save_checkpoint('best_model.pt')
+                    logger.info("  New best model saved!")
 
             # 定期保存
             if (epoch + 1) % 50 == 0:
@@ -378,7 +418,7 @@ def main():
     train_config = TrainConfig(
         batch_size=100,
         learning_rate=5e-5,
-        num_epochs=500
+        num_epochs=500  # 临时改为6轮，验证Nash层（原500）
     )
 
     # 创建模型

@@ -80,7 +80,7 @@ class ModelConfig:
         'joint_consistency_threshold': 0.5,
         'car_mode_indices': [7],
     })
-    nash_bargaining_start_epoch: int = 20  # 从第几个epoch开始使用Nash Bargaining
+    nash_bargaining_start_epoch: int = 3  # 从第几个epoch开始使用Nash Bargaining（调低以快速验证）
 
 
 

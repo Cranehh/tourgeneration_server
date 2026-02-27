@@ -42,6 +42,8 @@ except ImportError:
     print("Warning: qpth not available. Install with: pip install qpth")
 
 
+
+
 class NashBargainingSQPOptNet(nn.Module):
     """
     Nash Bargaining SQP + OptNet layer.
@@ -71,10 +73,6 @@ class NashBargainingSQPOptNet(nn.Module):
         self.num_modes = num_modes
         self.max_members = max_members
         self.max_activities = max_activities
-        self.alpha_joint = alpha_joint
-        self.alpha_social = alpha_social
-        self.theta_escort = theta_escort
-        self.utility_baseline = utility_baseline
         self.lambda_anchor = lambda_anchor
         self.joint_consistency_threshold = joint_consistency_threshold
         self.car_mode_indices = car_mode_indices or [7]
@@ -86,14 +84,18 @@ class NashBargainingSQPOptNet(nn.Module):
         self.vars_per_member = max_activities * self.vars_per_activity
         self.total_vars = max_members * self.vars_per_member
 
-        # Travel time coefficients per mode (11 modes)
-        # 0:walk(-1.5) 1:bus(-0.4) 2:metro(-0.4) 3:bike(-0.8) 4:ebike(-0.8)
-        # 5:car(-1.0) 6:other_motor(-1.0) 7:shuttle(-0.4) 8:taxi(-1.0) 9:motorcycle(-0.8) 10:other(-0.5)
-        theta_travel = torch.tensor([
+        # Learnable utility parameters — updated via KKT implicit function theorem
+        # QPFunction backward: ∂d*/∂Q (depends on U → depends on these params)
+        self.alpha_joint = nn.Parameter(torch.tensor(alpha_joint))
+        self.alpha_social = nn.Parameter(torch.tensor(alpha_social))
+        self.theta_escort = nn.Parameter(torch.tensor(theta_escort))
+        self.utility_baseline = nn.Parameter(torch.tensor(utility_baseline))
+
+        theta_travel_init = torch.tensor([
             -1.5, -0.4, -0.4, -0.8, -0.8,
             -1.0, -1.0, -0.4, -1.0, -0.8, -0.5
         ][:num_modes])
-        self.register_buffer('theta_travel', theta_travel)
+        self.theta_travel = nn.Parameter(theta_travel_init)
 
         # Time z-score bounds: mean=12.946, std=4.691
         self.time_mean = 12.946
@@ -101,12 +103,150 @@ class NashBargainingSQPOptNet(nn.Module):
         self.z_min = (1 - self.time_mean) / self.time_std     # ≈ -2.55
         self.z_max = (24 - self.time_mean) / self.time_std    # ≈ 2.36
 
-        self.eps = 1e-6
+        self.eps = 1e-3  # Must be large enough that log(eps) is safe in float16
         self.enabled = True
+
+        # Precompute constraint index templates (run once, no Python loops at forward time)
+        self._precompute_constraint_indices()
 
     def set_enabled(self, enabled: bool):
         """Dynamically enable/disable the Nash layer."""
         self.enabled = enabled
+
+    def _precompute_constraint_indices(self):
+        """Precompute all constraint templates and index arrays.
+
+        Called once at __init__. All Python for-loops run here only.
+        At forward time, constraints are built via expand/gather — zero loops.
+        """
+        M = self.max_members
+        T = self.max_activities
+        K = self.num_modes
+        V = self.vars_per_activity
+        n = self.total_vars
+
+        # ---- Bound templates [n] ----
+        lb = torch.full((n,), self.eps)
+        ub = torch.full((n,), 1 - self.eps)
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                lb[base]     = self.z_min
+                ub[base]     = self.z_max
+                lb[base + 1] = self.z_min
+                ub[base + 1] = self.z_max
+        self.register_buffer('lb_template', lb)
+        self.register_buffer('ub_template', ub)
+
+        # ---- Time ordering: index pairs for G rows ----
+        # Each constraint: d[pos_idx] - d[neg_idx] <= x[neg_idx] - x[pos_idx]
+        time_pos_idx = []  # index where G row has +1
+        time_neg_idx = []  # index where G row has -1
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                si, ei = base, base + 1
+                # end >= start
+                time_pos_idx.append(si)
+                time_neg_idx.append(ei)
+                # start(t+1) >= end(t)
+                if t < T - 1:
+                    next_si = m * self.vars_per_member + (t + 1) * V
+                    time_pos_idx.append(ei)
+                    time_neg_idx.append(next_si)
+
+        self.register_buffer('time_pos_idx', torch.tensor(time_pos_idx, dtype=torch.long))
+        self.register_buffer('time_neg_idx', torch.tensor(time_neg_idx, dtype=torch.long))
+        num_time_rows = len(time_pos_idx)
+
+        # Build sparse time_G_template [num_time_rows, n]
+        time_G = torch.zeros(num_time_rows, n)
+        for i in range(num_time_rows):
+            time_G[i, time_pos_idx[i]] = 1.0
+            time_G[i, time_neg_idx[i]] = -1.0
+        self.register_buffer('time_G_template', time_G)
+
+        # ---- Vehicle constraint indices ----
+        veh_drv_idx = []
+        veh_car_idx = []
+        veh_member_idx = []
+        veh_activity_idx = []
+        car_idx = self.car_mode_indices[0]
+        for m in range(M):
+            for t in range(T):
+                base = m * self.vars_per_member + t * V
+                veh_drv_idx.append(base + 2 + K + 1)
+                veh_car_idx.append(base + 2 + car_idx)
+                veh_member_idx.append(m)
+                veh_activity_idx.append(t)
+        self.register_buffer('veh_drv_idx', torch.tensor(veh_drv_idx, dtype=torch.long))
+        self.register_buffer('veh_car_idx', torch.tensor(veh_car_idx, dtype=torch.long))
+        self.register_buffer('veh_member_idx', torch.tensor(veh_member_idx, dtype=torch.long))
+        self.register_buffer('veh_activity_idx', torch.tensor(veh_activity_idx, dtype=torch.long))
+
+        # ---- Mode normalisation: A_mode_template [M*T, n] ----
+        A_mode = torch.zeros(M * T, n)
+        for m in range(M):
+            for t in range(T):
+                eq_idx = m * T + t
+                base = m * self.vars_per_member + t * V
+                for k in range(K):
+                    A_mode[eq_idx, base + 2 + k] = 1.0
+        self.register_buffer('A_mode_template', A_mode)
+
+        # ---- Joint travel consistency: member pair indices ----
+        pair_t = []
+        pair_m1 = []
+        pair_m2 = []
+        pair_base_m1 = []
+        pair_base_m2 = []
+        for t in range(T):
+            for m1 in range(M):
+                for m2 in range(m1 + 1, M):
+                    pair_t.append(t)
+                    pair_m1.append(m1)
+                    pair_m2.append(m2)
+                    pair_base_m1.append(m1 * self.vars_per_member + t * V)
+                    pair_base_m2.append(m2 * self.vars_per_member + t * V)
+
+        num_pairs = len(pair_t)
+        self.register_buffer('pair_t', torch.tensor(pair_t, dtype=torch.long))
+        self.register_buffer('pair_m1', torch.tensor(pair_m1, dtype=torch.long))
+        self.register_buffer('pair_m2', torch.tensor(pair_m2, dtype=torch.long))
+
+        # Per pair: 2 (start, end) + K (mode) equality constraints
+        rows_per_pair = 2 + K
+        # Build joint_A_template [num_pairs * rows_per_pair, n]
+        # and index arrays for b computation
+        joint_A = torch.zeros(num_pairs * rows_per_pair, n)
+        joint_col_m1 = []  # column index in x for m1 variable
+        joint_col_m2 = []  # column index in x for m2 variable
+        for p in range(num_pairs):
+            bm1 = pair_base_m1[p]
+            bm2 = pair_base_m2[p]
+            row_base = p * rows_per_pair
+            # start constraint
+            joint_A[row_base, bm1] = 1.0
+            joint_A[row_base, bm2] = -1.0
+            joint_col_m1.append(bm1)
+            joint_col_m2.append(bm2)
+            # end constraint
+            joint_A[row_base + 1, bm1 + 1] = 1.0
+            joint_A[row_base + 1, bm2 + 1] = -1.0
+            joint_col_m1.append(bm1 + 1)
+            joint_col_m2.append(bm2 + 1)
+            # mode constraints
+            for k in range(K):
+                joint_A[row_base + 2 + k, bm1 + 2 + k] = 1.0
+                joint_A[row_base + 2 + k, bm2 + 2 + k] = -1.0
+                joint_col_m1.append(bm1 + 2 + k)
+                joint_col_m2.append(bm2 + 2 + k)
+
+        self.register_buffer('joint_A_template', joint_A)
+        self.register_buffer('joint_col_m1', torch.tensor(joint_col_m1, dtype=torch.long))
+        self.register_buffer('joint_col_m2', torch.tensor(joint_col_m2, dtype=torch.long))
+        self.num_pairs = num_pairs
+        self.rows_per_pair = rows_per_pair
 
     # =====================================================================
     #                         Forward Pass
@@ -162,14 +302,12 @@ class NashBargainingSQPOptNet(nn.Module):
         dest_logits = predictions['destination'].detach()
         dest_prob = F.softmax(dest_logits, dim=-1)  # [B, M, T, Z]
 
-        # out_of_home_prob = 1 - P(dest == home)
         home_idx = home_zone.long().view(-1, 1, 1, 1).expand(
             batch_size, self.max_members, self.max_activities, 1
         )
-        at_home_prob = dest_prob.gather(-1, home_idx).squeeze(-1)  # [B, M, T]
+        at_home_prob = dest_prob.gather(-1, home_idx).squeeze(-1)
         out_of_home_prob = (1 - at_home_prob).detach()
 
-        # expected travel time [B, M, T, K]
         expected_tt = self._compute_expected_tt(
             dest_prob, home_zone, travel_time_matrix
         ).detach()
@@ -177,7 +315,6 @@ class NashBargainingSQPOptNet(nn.Module):
         # ---- Pack decoder outputs ----
         theta_packed = self._pack_from_predictions(predictions)  # [B, n] keeps grad
         x0 = theta_packed.detach().clone()
-
         var_mask = self._build_var_mask(activity_mask)  # [B, n]
 
         # ---- Phase 1: SQP (no gradient) ----
@@ -187,7 +324,7 @@ class NashBargainingSQPOptNet(nn.Module):
             out_of_home_prob, expected_tt
         )
 
-        # ---- Phase 2: OptNet (gradient through theta_packed) ----
+        # ---- Phase 2: OptNet (gradient through theta_packed via KKT) ----
         x_final = self._optnet_phase(
             x_converged, theta_packed, var_mask,
             member_mask, activity_mask,
@@ -197,6 +334,7 @@ class NashBargainingSQPOptNet(nn.Module):
 
         # ---- Unpack ----
         return self._unpack_to_predictions(x_final, predictions, activity_mask)
+
 
     # =====================================================================
     #                     Variable Packing / Unpacking
@@ -261,9 +399,9 @@ class NashBargainingSQPOptNet(nn.Module):
             original_predictions['continuous'],
         )
 
-        # --- mode: prob → log-prob (logits) ---
+        # --- mode: prob → log-prob (logits), clamped for AMP safety ---
         mode_prob_safe = unpacked['mode_prob'].clamp(min=self.eps)
-        new_mode_logits = torch.log(mode_prob_safe)
+        new_mode_logits = torch.log(mode_prob_safe).clamp(min=-7.0)  # log(1e-3)≈-6.9
         result['mode'] = torch.where(
             mask_4d.expand_as(new_mode_logits),
             new_mode_logits,
@@ -272,7 +410,9 @@ class NashBargainingSQPOptNet(nn.Module):
 
         # --- joint: scalar prob → 2-class log-prob ---
         jp = unpacked['joint_prob'].clamp(self.eps, 1 - self.eps)
-        new_joint_logits = torch.stack([torch.log(1 - jp), torch.log(jp)], dim=-1)
+        new_joint_logits = torch.stack([
+            torch.log(1 - jp), torch.log(jp)
+        ], dim=-1).clamp(min=-7.0)
         result['joint'] = torch.where(
             mask_4d.expand_as(new_joint_logits),
             new_joint_logits,
@@ -281,7 +421,9 @@ class NashBargainingSQPOptNet(nn.Module):
 
         # --- driver: scalar prob → 2-class log-prob ---
         dp = unpacked['driver_prob'].clamp(self.eps, 1 - self.eps)
-        new_driver_logits = torch.stack([torch.log(1 - dp), torch.log(dp)], dim=-1)
+        new_driver_logits = torch.stack([
+            torch.log(1 - dp), torch.log(dp)
+        ], dim=-1).clamp(min=-7.0)
         result['driver'] = torch.where(
             mask_4d.expand_as(new_driver_logits),
             new_driver_logits,
@@ -353,12 +495,8 @@ class NashBargainingSQPOptNet(nn.Module):
         mask = activity_mask  # [B, M, T]
         duration = end - start  # [B, M, T]  (z-score space)
 
-        # Baseline
-        U = torch.full(
-            (x.shape[0], self.max_members),
-            self.utility_baseline,
-            device=x.device, dtype=x.dtype,
-        )
+        # Baseline (expand learnable scalar to [B, M])
+        U = self.utility_baseline.expand(x.shape[0], self.max_members).clone()
 
         # Social utility
         U_social = self.alpha_social * (out_of_home_prob * mask).sum(dim=-1)
@@ -385,10 +523,45 @@ class NashBargainingSQPOptNet(nn.Module):
         U_total = torch.where(
             member_mask > 0,
             U_total,
-            torch.full_like(U_total, self.utility_baseline),
+            self.utility_baseline.detach().expand_as(U_total),
         )
 
         return U_total  # [B, M]
+
+    def _compute_member_utilities_detached(
+        self,
+        x: Tensor, member_mask: Tensor, activity_mask: Tensor,
+        member_is_adult: Tensor, out_of_home_prob: Tensor, expected_tt: Tensor,
+        alpha_joint, alpha_social, theta_escort, utility_baseline, theta_travel,
+    ) -> Tensor:
+        """Same as _compute_member_utilities but takes params as args (detached).
+
+        Used in SQP inner loop to avoid accumulating gradient graph through nn.Parameters.
+        """
+        unpacked = self._unpack_flat(x)
+        start = unpacked['start_time']
+        end = unpacked['end_time']
+        mode_prob = unpacked['mode_prob']
+        joint_prob = unpacked['joint_prob']
+        driver_prob = unpacked['driver_prob']
+
+        mask = activity_mask
+        duration = end - start
+
+        U = torch.full((x.shape[0], self.max_members), utility_baseline.item(),
+                        device=x.device, dtype=x.dtype)
+        U_social = alpha_social * (out_of_home_prob * mask).sum(dim=-1)
+        U_joint = alpha_joint * (joint_prob * mask).sum(dim=-1)
+        escort_time = (driver_prob * duration * mask).sum(dim=-1)
+        U_escort = theta_escort * escort_time * member_is_adult
+        travel_per_trip = (mode_prob * expected_tt * theta_travel).sum(dim=-1)
+        U_travel = (out_of_home_prob * travel_per_trip * mask).sum(dim=-1)
+
+        U_total = U + U_social + U_joint + U_escort + U_travel
+        U_total = U_total + F.softplus(1.0 - U_total)
+        U_total = torch.where(member_mask > 0, U_total,
+                              torch.full_like(U_total, utility_baseline.item()))
+        return U_total
 
     def _compute_nash_welfare(
         self, utilities: Tensor, member_mask: Tensor
@@ -412,25 +585,45 @@ class NashBargainingSQPOptNet(nn.Module):
         out_of_home_prob: Tensor,
         expected_tt: Tensor,
     ) -> Tensor:
-        """SQP iterations to find a converged point.  No gradient needed."""
+        """SQP iterations to find a converged point.  No gradient needed.
+
+        Solves a reduced-dimension system using only valid variables (var_mask==1).
+        """
         B, n = x0.shape
         device = x0.device
 
-        x = x0.clone()
-        H = torch.eye(n, device=device).unsqueeze(0).expand(B, -1, -1).clone()
+        # ---- Compute valid variable indices (same across batch) ----
+        valid_idx = var_mask[0].bool()  # [n]
+        n_valid = valid_idx.sum().item()
 
-        prev_x = None
-        prev_grad = None
+        # If no valid variables, return immediately
+        if n_valid == 0:
+            return x0.clone()
+
+        x = x0.clone()
+        H_v = torch.eye(n_valid, device=device).unsqueeze(0).expand(B, -1, -1).clone()
+
+        prev_x_v = None
+        prev_grad_v = None
 
         with torch.no_grad():
+            # Detach learnable params for SQP inner loop to prevent graph accumulation
+            alpha_joint_val = self.alpha_joint.detach()
+            alpha_social_val = self.alpha_social.detach()
+            theta_escort_val = self.theta_escort.detach()
+            utility_baseline_val = self.utility_baseline.detach()
+            theta_travel_val = self.theta_travel.detach()
+
             for _ in range(self.sqp_max_iter):
-                # ---- gradient of Nash objective ----
-                x_var = x.clone().requires_grad_(True)
+                # ---- gradient of Nash objective (w.r.t. x only, not params) ----
+                x_var = x.detach().clone().requires_grad_(True)
 
                 with torch.enable_grad():
-                    utilities = self._compute_member_utilities(
+                    utilities = self._compute_member_utilities_detached(
                         x_var, member_mask, activity_mask,
                         member_is_adult, out_of_home_prob, expected_tt,
+                        alpha_joint_val, alpha_social_val, theta_escort_val,
+                        utility_baseline_val, theta_travel_val,
                     )
                     nash_obj = -self._compute_nash_welfare(utilities, member_mask)
                     grad = torch.autograd.grad(nash_obj.sum(), x_var)[0]
@@ -441,26 +634,34 @@ class NashBargainingSQPOptNet(nn.Module):
                 if torch.isnan(grad).any():
                     break
 
+                # Extract valid subsets
+                grad_v = grad[:, valid_idx]  # [B, n_valid]
+
                 # Convergence check
-                grad_norm = (grad * var_mask).norm(dim=-1)
+                grad_norm = grad_v.norm(dim=-1)
                 if (grad_norm < self.sqp_tol).all():
                     break
 
-                # BFGS update
-                if prev_x is not None:
-                    s = x - prev_x
-                    y = grad - prev_grad
-                    H = self._bfgs_update(H, s, y)
+                # BFGS update (reduced dimension)
+                x_v = x[:, valid_idx]  # [B, n_valid]
+                if prev_x_v is not None:
+                    s_v = x_v - prev_x_v
+                    y_v = grad_v - prev_grad_v
+                    H_v = self._bfgs_update(H_v, s_v, y_v)
 
-                prev_x = x.clone()
-                prev_grad = grad.clone()
+                prev_x_v = x_v.clone()
+                prev_grad_v = grad_v.clone()
 
-                # Newton step (unconstrained)
-                H_reg = H + 1e-3 * torch.eye(n, device=device).unsqueeze(0)
+                # Newton step on reduced system
+                H_reg_v = H_v + 1e-3 * torch.eye(n_valid, device=device).unsqueeze(0)
                 try:
-                    d = -torch.linalg.solve(H_reg, grad.unsqueeze(-1)).squeeze(-1)
+                    d_v = -torch.linalg.solve(H_reg_v, grad_v.unsqueeze(-1)).squeeze(-1)
                 except Exception:
-                    d = -grad / (torch.diagonal(H_reg, dim1=-2, dim2=-1) + 1e-6)
+                    d_v = -grad_v / (torch.diagonal(H_reg_v, dim1=-2, dim2=-1) + 1e-6)
+
+                # Expand back to full dimension
+                d = torch.zeros(B, n, device=device)
+                d[:, valid_idx] = d_v
 
                 # Armijo line search
                 alpha = self._line_search(
@@ -480,65 +681,64 @@ class NashBargainingSQPOptNet(nn.Module):
         return x
 
     def _bfgs_update(self, H: Tensor, s: Tensor, y: Tensor) -> Tensor:
-        """BFGS Hessian approximation update with Powell's damping."""
-        B, n, _ = H.shape
-        device = H.device
-        H_new = H.clone()
+        """Vectorized BFGS Hessian approximation update with Powell's damping.
 
-        for b in range(B):
-            sb, yb = s[b], y[b]
+        All operations are batched — no Python for-loop over B.
+        H: [B, n, n], s: [B, n], y: [B, n]
+        """
+        # 1. Batch dot products
+        sy = (s * y).sum(dim=-1)                              # [B]
+        Hs = torch.bmm(H, s.unsqueeze(-1)).squeeze(-1)       # [B, n]
+        sHs = (s * Hs).sum(dim=-1)                           # [B]
 
-            # ---- Input validation ----
-            if torch.isnan(sb).any() or torch.isnan(yb).any():
-                continue
-            if torch.isinf(sb).any() or torch.isinf(yb).any():
-                continue
-            if sb.norm() < 1e-12 or sb.norm() > 1e6:
-                continue
-            if yb.norm() < 1e-12 or yb.norm() > 1e6:
-                continue
+        # 2. Combined validity mask (replaces all if/continue)
+        s_norm = s.norm(dim=-1)
+        y_norm = y.norm(dim=-1)
+        valid = (
+            ~torch.isnan(s).any(-1) & ~torch.isnan(y).any(-1)
+            & ~torch.isinf(s).any(-1) & ~torch.isinf(y).any(-1)
+            & (s_norm > 1e-12) & (s_norm < 1e6)
+            & (y_norm > 1e-12) & (y_norm < 1e6)
+            & ~torch.isnan(sHs) & ~torch.isinf(sHs)
+            & (sHs > 1e-12)
+        )  # [B]
 
-            sy = torch.dot(sb, yb)
-            Hs = H[b] @ sb
-            sHs = torch.dot(sb, Hs)
+        # 3. Powell's damping (torch.where replaces if)
+        theta = torch.where(
+            sy < 0.2 * sHs,
+            (0.8 * sHs / (sHs - sy + 1e-10)).clamp(0.0, 1.0),
+            torch.ones_like(sy),
+        )
+        y_d = theta.unsqueeze(-1) * y + (1 - theta).unsqueeze(-1) * Hs
+        sy_d = (s * y_d).sum(-1)
+        valid = valid & (sy_d > 1e-6)
 
-            if torch.isnan(sHs) or torch.isinf(sHs) or sHs < 1e-12:
-                continue
+        rho = 1.0 / (sy_d + 1e-10)
+        valid = valid & (rho < 1e6)
 
-            # Powell's damping
-            if sy < 0.2 * sHs:
-                theta = 0.8 * sHs / (sHs - sy + 1e-10)
-                theta = theta.clamp(0.0, 1.0)
-                yb = theta * yb + (1 - theta) * Hs
-                sy = torch.dot(sb, yb)
+        # 4. Batched rank-2 BFGS update
+        s_c = s.unsqueeze(-1)       # [B, n, 1]
+        y_c = y_d.unsqueeze(-1)     # [B, n, 1]
+        rho3 = rho[:, None, None]   # [B, 1, 1]
 
-            if sy < 1e-6:
-                continue
+        term1 = rho3 * torch.bmm(s_c, torch.bmm(y_c.transpose(-2, -1), H))
+        term2 = rho3 * torch.bmm(torch.bmm(H, y_c), s_c.transpose(-2, -1))
+        yHy = (y_d * torch.bmm(H, y_c).squeeze(-1)).sum(-1)  # [B]
+        term3 = (rho3 ** 2 * yHy[:, None, None]) * torch.bmm(s_c, s_c.transpose(-2, -1))
+        term4 = rho3 * torch.bmm(s_c, s_c.transpose(-2, -1))
+        H_cand = H - term1 - term2 + term3 + term4
 
-            rho = 1.0 / sy
-            if rho > 1e6:
-                continue
+        # 5. Post-validation + selective application
+        # Flatten last two dims for compatibility with older PyTorch
+        H_flat = H_cand.reshape(H_cand.shape[0], -1)  # [B, n*n]
+        valid = valid & (
+            ~torch.isnan(H_flat).any(dim=-1)
+            & ~torch.isinf(H_flat).any(dim=-1)
+            & (torch.diagonal(H_cand, dim1=-2, dim2=-1) > 0).all(-1)
+            & (H_flat.abs().max(dim=-1).values < 1e8)
+        )
 
-            # BFGS rank-2 update
-            I = torch.eye(n, device=device)
-            s_col = sb.unsqueeze(1)
-            y_col = yb.unsqueeze(1)
-
-            left  = I - rho * s_col @ y_col.T
-            right = I - rho * y_col @ s_col.T
-            H_candidate = left @ H[b] @ right + rho * s_col @ s_col.T
-
-            # ---- Output validation ----
-            if torch.isnan(H_candidate).any() or torch.isinf(H_candidate).any():
-                continue
-            if (torch.diag(H_candidate) <= 0).any():
-                continue
-            if H_candidate.abs().max() > 1e8:
-                continue
-
-            H_new[b] = H_candidate
-
-        return H_new
+        return torch.where(valid[:, None, None], H_cand, H)
 
     def _line_search(
         self, x, d, var_mask, member_mask, activity_mask,
@@ -620,65 +820,116 @@ class NashBargainingSQPOptNet(nn.Module):
         out_of_home_prob: Tensor,
         expected_tt: Tensor,
     ) -> Tensor:
-        """OptNet phase: solve QP with gradient through θ_packed.
+        """OptNet phase: solve reduced-dimension QP with gradient through θ_packed.
 
-        QP:  min  0.5 d^T Q d + p^T d   s.t.  G d ≤ h,  A d = b
-
-        Q = Q_nash_diag(detached) + λ_anchor · I
-        p = g_nash(detached, ≈0 at converged) + λ_anchor · (x_conv.detach() − θ_packed)
-
-        θ_packed keeps computation graph → p depends on θ → OptNet 通过 KKT 传梯度.
+        Only optimizes valid variables (var_mask==1), reducing QP from n=720 to n_valid≈135.
         """
         B, n = x_converged.shape
         device = x_converged.device
 
-        # ---- Utility values at converged point (for Q_nash_diag) ----
-        utilities = self._compute_member_utilities(
-            x_converged, member_mask, activity_mask,
-            member_is_adult, out_of_home_prob, expected_tt,
-        )  # [B, M]
+        # ---- Valid variable indices ----
+        valid_idx = var_mask[0].bool()  # [n]
+        n_valid = valid_idx.sum().item()
 
-        inv_U    = (1.0 / utilities.clamp(min=1.0)).detach()   # [B, M]
-        inv_U_sq = (inv_U ** 2).detach()                        # [B, M]
+        if n_valid == 0:
+            return theta_packed.clone()
+
+        # ---- Utility values at converged point (for Q_nash_diag) ----
+        # x_converged is detached, but utility params (alpha_joint, etc.) are NOT detached.
+        # This allows KKT backward: ∂d*/∂Q → ∂Q/∂(1/U²) → ∂U/∂params
+        utilities = self._compute_member_utilities(
+            x_converged.detach(), member_mask, activity_mask,
+            member_is_adult, out_of_home_prob, expected_tt,
+        )  # [B, M] — carries grad through params
+
+        inv_U    = 1.0 / utilities.clamp(min=1.0)              # [B, M]
+        inv_U_sq = inv_U ** 2                                    # [B, M]
 
         # Expand to per-variable dimension
         inv_U_sq_expanded = inv_U_sq.unsqueeze(-1).unsqueeze(-1).expand(
             -1, -1, self.max_activities, self.vars_per_activity
         ).reshape(B, n)
 
-        # ---- Q = diag(1/U_n²) + λ I ----
-        Q_diag = inv_U_sq_expanded + self.lambda_anchor
-        Q = torch.diag_embed(Q_diag)  # [B, n, n]
+        # ---- Full-dimensional Q_diag and p (p depends on θ!) ----
+        Q_diag_full = inv_U_sq_expanded + self.lambda_anchor    # [B, n]
+        p_full = self.lambda_anchor * (x_converged.detach() - theta_packed)  # depends on θ!
 
-        # ---- p = λ (x_conv − θ)  (g_nash ≈ 0 at converged point) ----
-        p = self.lambda_anchor * (x_converged.detach() - theta_packed)  # depends on θ!
-
-        # ---- Constraints ----
-        G, h, A, b = self._build_optnet_constraints(
+        # ---- Full-dimensional constraints ----
+        G_full, h, A_full, b = self._build_optnet_constraints(
             x_converged, var_mask, member_mask, activity_mask,
             num_vehicles, member_is_adult,
         )
 
-        # ---- Solve QP ----
+        # ---- Reduce to valid variables only ----
+        Q_v_diag = Q_diag_full[:, valid_idx]                    # [B, n_valid]
+        Q_v = torch.diag_embed(Q_v_diag)                       # [B, n_valid, n_valid]
+        p_v = p_full[:, valid_idx]                              # [B, n_valid]
+        G_v = G_full[:, :, valid_idx]                           # [B, num_ineq, n_valid]
+        A_v = A_full[:, :, valid_idx]                           # [B, num_eq, n_valid]
+
+        # Remove all-zero equality rows (inactive constraints for masked variables)
+        if A_v.shape[1] > 0:
+            active_eq = A_v.abs().sum(dim=(0, 2)) > 1e-12      # [num_eq]
+            A_v = A_v[:, active_eq]
+            b = b[:, active_eq]
+
+        # Remove linearly dependent equality rows via QR rank detection
+        # This prevents qpth from encountering singular KKT systems
+        if A_v.shape[1] > 0:
+            # Use the first batch element (constraint structure is similar across batch)
+            try:
+                _, R = torch.linalg.qr(A_v[0].double().T)  # R: [num_eq, num_eq]
+                diag_R = torch.abs(torch.diag(R))
+                indep_mask = diag_R > 1e-8
+                if indep_mask.sum() < A_v.shape[1]:
+                    A_v = A_v[:, indep_mask]
+                    b = b[:, indep_mask]
+            except Exception:
+                pass  # keep all rows if QR fails
+
+        # Remove all-zero inequality rows similarly
+        if G_v.shape[1] > 0:
+            active_ineq = G_v.abs().sum(dim=(0, 2)) > 1e-12
+            G_v = G_v[:, active_ineq]
+            h = h[:, active_ineq]
+
+        # Slightly relax inequality bounds to improve feasibility
+        if h.shape[1] > 0:
+            h = h + 1e-4
+
+        # ---- Solve reduced QP with gradient (KKT implicit function theorem) ----
         try:
             if QPTH_AVAILABLE:
-                d_star = QPFunction(verbose=False, maxIter=100, eps=1e-6)(
-                    Q.double(), p.double(),
-                    G.double(), h.double(),
-                    A.double(), b.double(),
+                d_v_star = QPFunction(verbose=False, maxIter=200, eps=1e-8)(
+                    Q_v.double(), p_v.double(),
+                    G_v.double(), h.double(),
+                    A_v.double(), b.double(),
                 ).float()
             else:
-                d_star = self._fallback_qp_solve(Q, p, G, h, A, b)
-        except Exception as e:
-            # Fallback: d* = 0  →  Nash layer ≡ identity, gradient still flows
-            d_star = torch.zeros_like(theta_packed)
+                d_v_star = self._fallback_qp_solve(Q_v, p_v, G_v, h, A_v, b)
+        except Exception:
+            d_v_star = torch.zeros(B, n_valid, device=device)
 
-        # NaN fallback
-        if torch.isnan(d_star).any():
-            d_star = torch.zeros_like(theta_packed)
+        # NaN/Inf fallback
+        if torch.isnan(d_v_star).any() or torch.isinf(d_v_star).any():
+            d_v_star = torch.zeros(B, n_valid, device=device)
 
-        # ---- x_final = θ + (x_conv − θ).detach() + d* ----
+        # Clamp d_star to prevent extreme values
+        d_v_star = d_v_star.clamp(-10.0, 10.0)
+
+        # ---- Expand back to full dimension (preserves gradient from QPFunction) ----
+        valid_positions = valid_idx.nonzero(as_tuple=True)[0]  # [n_valid]
+        d_star = theta_packed.new_zeros(B, n)
+        d_star = d_star.scatter(1, valid_positions.unsqueeze(0).expand(B, -1), d_v_star)
+
+        # ---- x_final = θ + (x_conv − θ).detach() + d*(θ) ----
+        # d* carries gradient through QPFunction's KKT backward (implicit function theorem)
+        # p = λ(x_conv - θ) → ∂d*/∂θ via KKT → decoder learns to align with Nash equilibrium
         x_final = theta_packed + (x_converged - theta_packed).detach() + d_star
+
+        if torch.isnan(x_final).any():
+            x_final = theta_packed  # Fallback: skip Nash adjustment
+
         x_final = self._project_to_feasible(x_final)
 
         return x_final
@@ -696,7 +947,7 @@ class NashBargainingSQPOptNet(nn.Module):
         num_vehicles: Tensor,     # [B]
         member_is_adult: Tensor,  # [B, M]
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Build QP constraints:  G d ≤ h,  A d = b.
+        """Build QP constraints using precomputed templates — zero Python loops.
 
         Inequality (G d ≤ h):
             1. Bound constraints
@@ -721,151 +972,81 @@ class NashBargainingSQPOptNet(nn.Module):
 
         I_n = torch.eye(n, device=device).unsqueeze(0).expand(B, -1, -1)
 
-        # ---- 1. Bound constraints ----
-        lb = torch.full((B, n), self.eps, device=device)
-        ub = torch.full((B, n), 1 - self.eps, device=device)
+        # ---- 1. Bound constraints (expand precomputed templates) ----
+        lb = self.lb_template.unsqueeze(0).expand(B, -1)
+        ub = self.ub_template.unsqueeze(0).expand(B, -1)
 
-        for m in range(M):
-            for t in range(T):
-                base = m * self.vars_per_member + t * V
-                lb[:, base]     = self.z_min   # start lb
-                ub[:, base]     = self.z_max   # start ub
-                lb[:, base + 1] = self.z_min   # end lb
-                ub[:, base + 1] = self.z_max   # end ub
-
-        # -I d ≤ x_conv − lb   (lower bound)
         G_list.append(-I_n)
         h_list.append(x_conv - lb)
-        #  I d ≤ ub − x_conv   (upper bound)
         G_list.append(I_n)
         h_list.append(ub - x_conv)
 
-        # ---- 2. Time ordering constraints ----
-        time_G_rows: list[Tensor] = []
-        time_h_vals: list[Tensor] = []
+        # ---- 2. Time ordering (expand template + gather h) ----
+        time_G = self.time_G_template.unsqueeze(0).expand(B, -1, -1)
+        time_h = x_conv[:, self.time_neg_idx] - x_conv[:, self.time_pos_idx]  # [B, num_time_rows]
+        G_list.append(time_G)
+        h_list.append(time_h)
 
-        for m in range(M):
-            for t in range(T):
-                base = m * self.vars_per_member + t * V
-                si = base       # start index
-                ei = base + 1   # end index
-
-                # end ≥ start  →  d[start] − d[end] ≤ x_conv[end] − x_conv[start]
-                row = torch.zeros(B, n, device=device)
-                row[:, si] =  1.0
-                row[:, ei] = -1.0
-                time_G_rows.append(row)
-                time_h_vals.append(x_conv[:, ei] - x_conv[:, si])
-
-                # start(t+1) ≥ end(t)
-                if t < T - 1:
-                    next_si = m * self.vars_per_member + (t + 1) * V
-                    row2 = torch.zeros(B, n, device=device)
-                    row2[:, ei]      =  1.0
-                    row2[:, next_si] = -1.0
-                    time_G_rows.append(row2)
-                    time_h_vals.append(x_conv[:, next_si] - x_conv[:, ei])
-
-        if time_G_rows:
-            G_list.append(torch.stack(time_G_rows, dim=1))
-            h_list.append(torch.stack(time_h_vals, dim=1))
-
-        # ---- 3. Vehicle constraint (linearised bilinear) ----
+        # ---- 3. Vehicle constraint (vectorized gather) ----
         x_4d = x_conv.reshape(B, M, T, V)
-        driver_p0 = x_4d[..., 2 + K + 1]                        # [B, M, T]
-        car_idx   = self.car_mode_indices[0]
-        car_p0    = x_4d[..., 2 + car_idx]                       # [B, M, T]
+        driver_p0 = x_4d[..., 2 + K + 1]     # [B, M, T]
+        car_p0 = x_4d[..., 2 + self.car_mode_indices[0]]  # [B, M, T]
+
+        # Flatten to [B, M*T] using precomputed indices
+        c0_flat = car_p0[:, self.veh_member_idx, self.veh_activity_idx]     # [B, M*T]
+        d0_flat = driver_p0[:, self.veh_member_idx, self.veh_activity_idx]  # [B, M*T]
+        adult_flat = member_is_adult[:, self.veh_member_idx]                # [B, M*T]
+        valid_flat = activity_mask[:, self.veh_member_idx, self.veh_activity_idx]  # [B, M*T]
+        weight = adult_flat * valid_flat  # [B, M*T]
 
         G_veh = torch.zeros(B, 1, n, device=device)
-        for m in range(M):
-            for t in range(T):
-                base = m * self.vars_per_member + t * V
-                drv_vi = base + 2 + K + 1
-                car_vi = base + 2 + car_idx
-
-                c0    = car_p0[:, m, t]
-                d0    = driver_p0[:, m, t]
-                adult = member_is_adult[:, m]
-                valid = activity_mask[:, m, t]
-
-                G_veh[:, 0, drv_vi] = c0 * adult * valid
-                G_veh[:, 0, car_vi] = d0 * adult * valid
+        # scatter driver and car coefficients
+        G_veh[:, 0, :].scatter_add_(
+            1, self.veh_drv_idx.unsqueeze(0).expand(B, -1),
+            c0_flat * weight,
+        )
+        G_veh[:, 0, :].scatter_add_(
+            1, self.veh_car_idx.unsqueeze(0).expand(B, -1),
+            d0_flat * weight,
+        )
 
         current_usage = (
             driver_p0 * car_p0 * member_is_adult.unsqueeze(-1) * activity_mask
         ).sum(dim=(1, 2))
         h_veh = (num_vehicles - current_usage).unsqueeze(-1)
-
         G_list.append(G_veh)
         h_list.append(h_veh)
 
-        # ---- 4. Mode probability normalisation (equality) ----
-        num_eq_mode = M * T
-        A_mode = torch.zeros(B, num_eq_mode, n, device=device)
-        b_mode = torch.zeros(B, num_eq_mode, device=device)
-
-        eq_idx = 0
-        for m in range(M):
-            for t in range(T):
-                base = m * self.vars_per_member + t * V
-                for k in range(K):
-                    A_mode[:, eq_idx, base + 2 + k] = 1.0
-                b_mode[:, eq_idx] = 0.0   # Σ Δmode_prob = 0
-                eq_idx += 1
-
+        # ---- 4. Mode normalisation (expand template) ----
+        A_mode = self.A_mode_template.unsqueeze(0).expand(B, -1, -1)
+        b_mode = torch.zeros(B, M * T, device=device)
         A_list.append(A_mode)
         b_list.append(b_mode)
 
-        # ---- 5. Joint travel consistency (equality, conditional) ----
-        joint_prob_conv = x_4d[..., 2 + K]   # [B, M, T]
+        # ---- 5. Joint travel consistency (vectorized) ----
+        if self.num_pairs > 0:
+            joint_prob_conv = x_4d[..., 2 + K]  # [B, M, T]
 
-        joint_A_rows: list[Tensor] = []
-        joint_b_vals: list[Tensor] = []
+            # Compute activation for all pairs at once
+            jp_m1 = joint_prob_conv[:, self.pair_m1, self.pair_t]  # [B, num_pairs]
+            jp_m2 = joint_prob_conv[:, self.pair_m2, self.pair_t]  # [B, num_pairs]
+            active = (jp_m1 * jp_m2 > self.joint_consistency_threshold).float()  # [B, num_pairs]
 
-        for t in range(T):
-            for m1 in range(M):
-                for m2 in range(m1 + 1, M):
-                    jp_prod = joint_prob_conv[:, m1, t] * joint_prob_conv[:, m2, t]
-                    active = (jp_prod > self.joint_consistency_threshold).float()  # [B]
+            # Expand active to per-row: [B, num_pairs * rows_per_pair]
+            active_exp = active.unsqueeze(-1).expand(
+                -1, -1, self.rows_per_pair
+            ).reshape(B, -1)  # [B, num_pairs * rows_per_pair]
 
-                    if active.sum() == 0:
-                        continue
+            # Apply activation mask to template
+            joint_A = self.joint_A_template.unsqueeze(0).expand(B, -1, -1) * active_exp.unsqueeze(-1)
 
-                    base_m1 = m1 * self.vars_per_member + t * V
-                    base_m2 = m2 * self.vars_per_member + t * V
+            # Compute b: active * (x[col_m2] - x[col_m1])
+            joint_b = active_exp * (
+                x_conv[:, self.joint_col_m2] - x_conv[:, self.joint_col_m1]
+            )
 
-                    # start(m1) = start(m2)
-                    row_s = torch.zeros(B, n, device=device)
-                    row_s[:, base_m1]     =  active
-                    row_s[:, base_m2]     = -active
-                    joint_A_rows.append(row_s)
-                    joint_b_vals.append(active * (x_conv[:, base_m2] - x_conv[:, base_m1]))
-
-                    # end(m1) = end(m2)
-                    row_e = torch.zeros(B, n, device=device)
-                    row_e[:, base_m1 + 1] =  active
-                    row_e[:, base_m2 + 1] = -active
-                    joint_A_rows.append(row_e)
-                    joint_b_vals.append(
-                        active * (x_conv[:, base_m2 + 1] - x_conv[:, base_m1 + 1])
-                    )
-
-                    # mode_prob(m1,t,k) = mode_prob(m2,t,k) for each k
-                    for k in range(K):
-                        row_mk = torch.zeros(B, n, device=device)
-                        row_mk[:, base_m1 + 2 + k] =  active
-                        row_mk[:, base_m2 + 2 + k] = -active
-                        joint_A_rows.append(row_mk)
-                        joint_b_vals.append(
-                            active * (
-                                x_conv[:, base_m2 + 2 + k]
-                                - x_conv[:, base_m1 + 2 + k]
-                            )
-                        )
-
-        if joint_A_rows:
-            A_list.append(torch.stack(joint_A_rows, dim=1))
-            b_list.append(torch.stack(joint_b_vals, dim=1))
+            A_list.append(joint_A)
+            b_list.append(joint_b)
 
         # ---- Combine ----
         G = torch.cat(G_list, dim=1)

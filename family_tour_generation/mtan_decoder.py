@@ -961,7 +961,10 @@ class MTANDecoder(nn.Module):
         else:
             self.nash_layer = None
         # 加载出行时间矩阵（需要预先准备）
-        travel_time_matrix = np.load('../数据/travel_time_matrix.npy')
+        import os
+        _current_dir = os.path.dirname(os.path.abspath(__file__))
+        travel_time_path = os.path.join(_current_dir, '..', '数据', 'travel_time_matrix.npy')
+        travel_time_matrix = np.load(travel_time_path)
         travel_time_matrix = torch.from_numpy(travel_time_matrix).float()
 
         self.register_buffer(
