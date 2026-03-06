@@ -318,7 +318,8 @@ class ScheduledSamplingTrainer:
         nan_loss_count = 0  # 连续NaN计数
         report_interval = 5  # 每5个epoch输出详细状态
 
-        for epoch in range(self.train_config.num_epochs):
+        start_epoch = self.current_epoch + 1 if self.current_epoch > 0 else 0
+        for epoch in range(start_epoch, self.train_config.num_epochs):
             self.current_epoch = epoch
             # 训练
             train_metrics = self.train_epoch()
@@ -551,9 +552,15 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_nash',
+        save_dir='../checkpoints_ss_with_condition_nash_without_end',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
+
+    # 从 checkpoint 恢复训练
+    resume_path = '../checkpoints_ss_with_condition_nash_without_end/checkpoint_epoch_249.pt'
+    if Path(resume_path).exists():
+        trainer.load_checkpoint(resume_path)
+        print(f"Resumed from checkpoint: {resume_path}")
 
     # 训练
     trainer.train()
