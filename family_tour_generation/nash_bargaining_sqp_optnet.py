@@ -214,8 +214,8 @@ class NashBargainingSQPOptNet(nn.Module):
         self.register_buffer('pair_m1', torch.tensor(pair_m1, dtype=torch.long))
         self.register_buffer('pair_m2', torch.tensor(pair_m2, dtype=torch.long))
 
-        # Per pair: 2 (start, end) + K (mode) equality constraints
-        rows_per_pair = 2 + K
+        # Per pair: 2 (start, end) + K (mode) + 1 (joint_prob) equality constraints
+        rows_per_pair = 2 + K + 1
         # Build joint_A_template [num_pairs * rows_per_pair, n]
         # and index arrays for b computation
         joint_A = torch.zeros(num_pairs * rows_per_pair, n)
@@ -241,6 +241,12 @@ class NashBargainingSQPOptNet(nn.Module):
                 joint_A[row_base + 2 + k, bm2 + 2 + k] = -1.0
                 joint_col_m1.append(bm1 + 2 + k)
                 joint_col_m2.append(bm2 + 2 + k)
+            # joint_prob symmetry constraint: joint_prob(m1,t) = joint_prob(m2,t)
+            joint_prob_offset = 2 + K
+            joint_A[row_base + 2 + K, bm1 + joint_prob_offset] = 1.0
+            joint_A[row_base + 2 + K, bm2 + joint_prob_offset] = -1.0
+            joint_col_m1.append(bm1 + joint_prob_offset)
+            joint_col_m2.append(bm2 + joint_prob_offset)
 
         self.register_buffer('joint_A_template', joint_A)
         self.register_buffer('joint_col_m1', torch.tensor(joint_col_m1, dtype=torch.long))
@@ -782,12 +788,15 @@ class NashBargainingSQPOptNet(nn.Module):
         K = self.num_modes
         x_4d = x.reshape(B, self.max_members, self.max_activities, self.vars_per_activity)
 
-        # Time bounds
+        # Time bounds with sequential ordering: end(t) >= start(t), start(t+1) >= end(t)
         start = x_4d[..., 0].clamp(self.z_min, self.z_max)
         end   = x_4d[..., 1].clamp(self.z_min, self.z_max)
-        # Ensure end >= start
-        end = torch.maximum(end, start + 0.01)
-        end = end.clamp(max=self.z_max)
+        min_gap = 0.01
+        for t in range(start.shape[-1]):
+            if t > 0:
+                start[..., t] = torch.maximum(start[..., t], end[..., t-1])
+            end[..., t] = torch.maximum(end[..., t], start[..., t] + min_gap)
+            end[..., t] = end[..., t].clamp(max=self.z_max)
 
         # Mode probability simplex
         mode_prob = x_4d[..., 2:2+K].clamp(min=self.eps)
@@ -1033,7 +1042,8 @@ class NashBargainingSQPOptNet(nn.Module):
             # Compute activation for all pairs at once
             jp_m1 = joint_prob_conv[:, self.pair_m1, self.pair_t]  # [B, num_pairs]
             jp_m2 = joint_prob_conv[:, self.pair_m2, self.pair_t]  # [B, num_pairs]
-            active = (jp_m1 * jp_m2 > self.joint_consistency_threshold).float()  # [B, num_pairs]
+            jp_product = jp_m1 * jp_m2  # [B, num_pairs]
+            active = torch.sigmoid(10.0 * (jp_product - self.joint_consistency_threshold))  # [B, num_pairs]
 
             # Expand active to per-row: [B, num_pairs * rows_per_pair]
             active_exp = active.unsqueeze(-1).expand(

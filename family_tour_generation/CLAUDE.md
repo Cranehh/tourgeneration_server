@@ -67,7 +67,7 @@ Does NOT modify: `purpose`, `destination`, `end` token.
 
 **Constraint structure**:
 - Inequality: bound constraints + time ordering (end≥start, start(t+1)≥end(t)) + vehicle constraint (linearised bilinear)
-- Equality: mode probability normalisation (Σmode=1) + joint travel consistency (conditional on joint_prob product > threshold)
+- Equality: mode probability normalisation (Σmode=1) + joint travel consistency including joint_prob symmetry (soft sigmoid activation on joint_prob product)
 
 **Constraint templates** are precomputed once in `_precompute_constraint_indices()` at `__init__` — zero Python loops at forward time.
 
