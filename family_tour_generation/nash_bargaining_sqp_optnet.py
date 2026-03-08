@@ -399,31 +399,34 @@ class NashBargainingSQPOptNet(nn.Module):
             original_predictions['continuous'],
         )
 
-        # --- mode: prob → log-prob (logits), clamped for AMP safety ---
+        # --- mode: prob → log-prob with straight-through gradient ---
         mode_prob_safe = unpacked['mode_prob'].clamp(min=self.eps)
-        new_mode_logits = torch.log(mode_prob_safe).clamp(min=-7.0)  # log(1e-3)≈-6.9
+        mode_prob_safe = mode_prob_safe / mode_prob_safe.sum(dim=-1, keepdim=True)  # re-normalize
+        log_mode = torch.log(mode_prob_safe).clamp(min=-7.0)
+        # Straight-through: forward = log(p), backward = identity (no 1/p distortion)
+        new_mode_logits = mode_prob_safe + (log_mode - mode_prob_safe).detach()
         result['mode'] = torch.where(
             mask_4d.expand_as(new_mode_logits),
             new_mode_logits,
             original_predictions['mode'],
         )
 
-        # --- joint: scalar prob → 2-class log-prob ---
+        # --- joint: scalar prob → 2-class log-prob with straight-through ---
         jp = unpacked['joint_prob'].clamp(self.eps, 1 - self.eps)
-        new_joint_logits = torch.stack([
-            torch.log(1 - jp), torch.log(jp)
-        ], dim=-1).clamp(min=-7.0)
+        raw_joint = torch.stack([1 - jp, jp], dim=-1)
+        log_joint = torch.log(raw_joint).clamp(min=-7.0)
+        new_joint_logits = raw_joint + (log_joint - raw_joint).detach()
         result['joint'] = torch.where(
             mask_4d.expand_as(new_joint_logits),
             new_joint_logits,
             original_predictions['joint'],
         )
 
-        # --- driver: scalar prob → 2-class log-prob ---
+        # --- driver: scalar prob → 2-class log-prob with straight-through ---
         dp = unpacked['driver_prob'].clamp(self.eps, 1 - self.eps)
-        new_driver_logits = torch.stack([
-            torch.log(1 - dp), torch.log(dp)
-        ], dim=-1).clamp(min=-7.0)
+        raw_driver = torch.stack([1 - dp, dp], dim=-1)
+        log_driver = torch.log(raw_driver).clamp(min=-7.0)
+        new_driver_logits = raw_driver + (log_driver - raw_driver).detach()
         result['driver'] = torch.where(
             mask_4d.expand_as(new_driver_logits),
             new_driver_logits,

@@ -80,6 +80,11 @@ Does NOT modify: `purpose`, `destination`, `end` token.
 - SQP grad NaN → break, hand off current `x` (possibly `x0`) to OptNet
 - BFGS update NaN/invalid → `torch.where(valid, H_cand, H)` (keep old Hessian)
 - Mode logits clamped to `[-7.0, ∞)` on unpack to prevent `log(0)` in AMP
+- Rollout skipped during Nash warm-up (first 10 epochs after `nash_bargaining_start_epoch`) to avoid conflicting gradients
+
+**Straight-through log unpack** (`_unpack_to_predictions`): Mode/joint/driver heads use `p + (log(p) - p).detach()` — forward = `log(p)` (correct loss), backward = identity (no `1/p` gradient distortion). Without this, non-target gradient for 11-class mode is ~11x too large (constant 1.0 vs proportional `p_i`).
+
+**Checkpoint compatibility**: `load_checkpoint()` in `train_with_ss_rollout.py` overrides `utility_baseline` from config after loading, since old checkpoints store the previous value (10.0) as `nn.Parameter`.
 
 **QR rank filtering**: before passing to QPFunction, removes linearly dependent equality rows via `torch.linalg.qr` to prevent singular KKT systems.
 
@@ -109,14 +114,18 @@ nash_config = {
     'alpha_joint': 0.1,       # learnable, init value
     'alpha_social': 0.3,      # learnable, init value
     'theta_escort': -0.58,    # learnable, init value
-    'utility_baseline': 10.0, # learnable, init value
-    'lambda_anchor': 0.1,     # soft anchor weight (fixed)
+    'utility_baseline': 2.0,  # learnable, init value (was 10.0 — too inert)
+    'lambda_anchor': 0.3,     # soft anchor weight, fixed (was 0.1)
     'sqp_max_iter': 15,
     'sqp_tol': 1e-4,
     'joint_consistency_threshold': 0.5,
     'car_mode_indices': [7],
 }
 ```
+
+**Nash correction weight** = `inv_U_sq / (inv_U_sq + lambda_anchor)`:
+- Old (baseline=10, λ=0.1): **9.1%** — nearly inert
+- Current (baseline=2, λ=0.3): **45.5%** — balanced Nash vs decoder
 
 ## Data Dimensions
 

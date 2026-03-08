@@ -672,7 +672,13 @@ class ExposureBiasTrainer:
         
         # 添加 rollout 损失 (epoch > 5 后开始)
         ar_loss = torch.tensor(0.0, device=member_repr.device)
-        if torch.rand(1).item() < rollout_prob:  # 概率做 rollout
+        # Skip rollout during Nash warm-up (first 10 epochs after Nash starts)
+        nash_warmup = (hasattr(self.model.decoder, 'nash_layer')
+                       and self.model.decoder.nash_layer is not None
+                       and self.model.decoder.nash_layer.enabled
+                       and current_epoch >= self.config.nash_bargaining_start_epoch
+                       and current_epoch < self.config.nash_bargaining_start_epoch + 10)
+        if torch.rand(1).item() < rollout_prob and not nash_warmup:
 
             start_pos = torch.randint(0, max(1, batch.activities.size(2) - rollout_length), (1,)).item()
             rollout_preds = autoregressive_rollout(

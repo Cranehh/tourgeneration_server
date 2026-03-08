@@ -391,6 +391,11 @@ class ScheduledSamplingTrainer:
         if 'eb_trainer_state' in checkpoint:
             self.eb_trainer.load_state_dict(checkpoint['eb_trainer_state'])
 
+        # Override utility_baseline to match new config (old checkpoints have 10.0)
+        if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'nash_layer') and self.model.decoder.nash_layer is not None:
+            self.model.decoder.nash_layer.utility_baseline.data.fill_(self.model_config.nash_config.get('utility_baseline', 2.0))
+            logger.info(f"Overrode nash utility_baseline to {self.model.decoder.nash_layer.utility_baseline.item():.1f}")
+
         logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
 
 
@@ -552,15 +557,15 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_nash_without_end',
+        save_dir='../checkpoints_ss_with_condition_nash_without_end2',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 
     # 从 checkpoint 恢复训练
-    resume_path = '../checkpoints_ss_with_condition_nash_without_end/checkpoint_epoch_249.pt'
-    if Path(resume_path).exists():
-        trainer.load_checkpoint(resume_path)
-        print(f"Resumed from checkpoint: {resume_path}")
+    # resume_path = '../checkpoints_ss_with_condition_nash_without_end/checkpoint_epoch_249.pt'
+    # if Path(resume_path).exists():
+    #     trainer.load_checkpoint(resume_path)
+    #     print(f"Resumed from checkpoint: {resume_path}")
 
     # 训练
     trainer.train()

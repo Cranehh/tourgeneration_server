@@ -73,10 +73,10 @@ class ModelConfig:
         'alpha_joint': 0.1,
         'alpha_social': 0.3,
         'theta_escort': -0.58,
-        'utility_baseline': 10.0,
+        'utility_baseline': 2.0,
         'sqp_max_iter': 15,
         'sqp_tol': 1e-4,
-        'lambda_anchor': 0.1,
+        'lambda_anchor': 0.3,
         'joint_consistency_threshold': 0.5,
         'car_mode_indices': [7],
     })
