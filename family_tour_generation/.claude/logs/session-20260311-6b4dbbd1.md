@@ -1,0 +1,54 @@
+# 📝 Work Log - family_tour_generation
+
+**Session ID**: 6b4dbbd1-f2d5-4568-97a0-db2a59839df1
+**Time**: 2026/03/11 15:46:57
+**Directory**: /mnt/d/OneDrive/Python scripts for big data/2025_11 博士论文第二章/family_tour_generation
+
+## 📊 Session Changes
+**Branch**: new_nash
+
+```
+M family_tour_generation/CLAUDE.md
+ M family_tour_generation/nash_bargaining_sqp_optnet.py
+ M family_tour_generation/train_with_ss_rollout.py
+?? .claude/
+?? .idea/
+?? .vscode/
+?? CLAUDE.md
+?? "Rezvany \347\255\211 - 2023 - Simulating intra-household interactions for in- and out-of-home activity scheduling.pdf"
+?? family_tour_generation/.claude/logs/session-20260309-4d2c71c6.md
+?? family_tour_generation/.claude/logs/session-20260309-dbd580ba.md
+?? family_tour_generation/.claude/logs/session-20260310-703ff9eb.md
+?? family_tour_generation/.claude/logs/session-20260311-3bd2b7dd.md
+?? family_tour_generation/.claude/logs/session-20260311-78b7852b.md
+?? family_tour_generation/.claude/logs/session-20260311-8cf1e3b6.md
+?? family_tour_generation/nash_model.aux
+?? family_tour_generation/nash_model.bbl
+?? family_tour_generation/nash_model.fdb_latexmk
+?? family_tour_generation/nash_model.fls
+?? family_tour_generation/nash_model.log
+?? family_tour_generation/nash_model.out
+?? family_tour_generation/nash_model.pdf
+?? family_tour_generation/nash_model.synctex.gz
+?? family_tour_generation/nash_model.tex
+?? gmm/
+?? gmm_149_118/
+?? gmm_lesscluster/
+?? nash-mtl-main/
+?? train_500ep.log
+?? "\344\277\256\346\224\271\350\256\260\345\275\225.txt"
+?? "\346\225\260\346\215\256/"
+```
+
+| Type | Count |
+|------|------|
+| Added | 27 |
+| Modified | 3 |
+| Deleted | 0 |
+
+## 🎯 Next Steps
+
+- ⚠️ Uncommitted changes detected (30 files)
+- ✅ CLAUDE.md memory is up to date
+- View context snapshot: `cat .claude/session-context-*.md`
+

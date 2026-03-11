@@ -155,18 +155,23 @@ class ScheduledSamplingTrainer:
                 )
                 self.optimizer.step()
 
-            # 统计
-            total_loss += loss.item()
-            for k, v in losses.items():
-                loss_components[k] += v.item()
+            # 统计 — extract scalars then detach to break autograd graph references
+            loss_val = loss.item()
+            losses_val = {k: v.item() for k, v in losses.items()}
+            total_loss += loss_val
+            for k, v in losses_val.items():
+                loss_components[k] += v
             num_batches += 1
             self.global_step += 1
+
+            # Free autograd graph promptly
+            del loss, losses
 
             # 获取当前 TF 概率
             tf_prob = self.eb_trainer.get_current_tf_prob()
 
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
+                'loss': f'{loss_val:.4f}',
                 'tf_prob': f'{tf_prob:.3f}',
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
             })
@@ -424,7 +429,7 @@ def main():
     train_config = TrainConfig(
         batch_size=100,
         learning_rate=5e-5,
-        num_epochs=500  # 临时改为6轮，验证Nash层（原500）
+        num_epochs=500
     )
 
     # 创建模型

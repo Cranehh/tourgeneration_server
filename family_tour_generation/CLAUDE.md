@@ -59,9 +59,11 @@ Does NOT modify: `purpose`, `destination`, `end` token.
 
 1. **Phase 1 — SQP** (`_sqp_phase`): BFGS + Armijo line search, finds converged point `x_converged`. Runs under `torch.no_grad()`. Uses `_compute_member_utilities_detached()` (takes params as arguments to avoid graph accumulation). NaN guard: if gradient is NaN or `x` becomes NaN, resets to `x0` and breaks — OptNet still fires.
 
-2. **Phase 2 — OptNet** (`_optnet_phase`): Solves reduced-dimension QP (valid variables only, ~135 of 720) via `QPFunction` (qpth). **Gradient flows through KKT implicit function theorem**:
+2. **Phase 2 — OptNet** (`_optnet_phase`): Solves reduced-dimension QP (valid variables only, ~135 of 720) via `QPFunction` (qpth) under `torch.no_grad()`. **Gradient flows through `_DiagonalQPBackward`** (custom autograd.Function that approximates KKT backward with diagonal QP structure, avoiding qpth's C++ reference cycle memory leak):
    - `p = λ(x_converged − θ_packed)` where `θ_packed` carries decoder grad
    - `Q_diag = 1/U² + λ` where `U` depends on learnable utility params
+   - `∂d*/∂p ≈ -1/Q_diag` → gradient to `θ_packed` (decoder)
+   - `∂d*/∂Q_diag ≈ -d*/Q_diag` → gradient to utility params
    - `x_final = θ_packed + (x_converged − θ_packed).detach() + d*(θ_packed)`
    - Learnable params updated: `alpha_joint`, `alpha_social`, `theta_escort`, `utility_baseline`, `theta_travel`
 
@@ -81,6 +83,10 @@ Does NOT modify: `purpose`, `destination`, `end` token.
 - BFGS update NaN/invalid → `torch.where(valid, H_cand, H)` (keep old Hessian)
 - Mode logits clamped to `[-7.0, ∞)` on unpack to prevent `log(0)` in AMP
 - Rollout skipped during Nash warm-up (first 10 epochs after `nash_bargaining_start_epoch`) to avoid conflicting gradients
+
+**`_project_to_feasible`**: Fully non-in-place implementation using list+stack for time ordering. Safe to call on tensors in the autograd graph (the old in-place version caused `RuntimeError: inplace operation` during backward).
+
+**`_DiagonalQPBackward`**: Custom `torch.autograd.Function` replacing qpth's KKT backward. QPFunction runs under `no_grad()` (correct constrained solution), then `_DiagonalQPBackward.apply(p_v, Q_v_diag, d_detached)` re-attaches gradient via diagonal approximation. Eliminates qpth's C++ reference cycle memory leak (~1750 MB/batch).
 
 **Straight-through log unpack** (`_unpack_to_predictions`): Mode/joint/driver heads use `p + (log(p) - p).detach()` — forward = `log(p)` (correct loss), backward = identity (no `1/p` gradient distortion). Without this, non-target gradient for 11-class mode is ~11x too large (constant 1.0 vs proportional `p_i`).
 

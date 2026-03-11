@@ -1,0 +1,482 @@
+% nash_model.tex — Nash Bargaining SQP+OptNet Layer: Mathematical Description
+% For PhD Dissertation Chapter 2
+% Author: 郝赫
+% Date: 2025
+
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{bm}
+\usepackage{geometry}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\indicator}{\mathbb{1}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\xconv}{\mathbf{x}_{\mathrm{conv}}}
+\newcommand{\xfinal}{\mathbf{x}_{\mathrm{final}}}
+\newcommand{\thetapacked}{\boldsymbol{\theta}}
+\newcommand{\softplus}{\mathrm{softplus}}
+
+\title{Nash Bargaining SQP+OptNet Layer: Mathematical Formulation}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+%% ====================================================================
+\section{Decision Variables}
+%% ====================================================================
+
+For a family with $M$ members, each member $m$ has at most $T$ activities.
+The per-activity decision vector is:
+\begin{equation}
+    \mathbf{x}_{m,t} = \bigl[\, s_{m,t},\; e_{m,t},\; p^{\mathrm{mode}}_{m,t,1}, \dots, p^{\mathrm{mode}}_{m,t,K},\; j_{m,t},\; d_{m,t} \,\bigr] \in \R^{V},
+    \label{eq:decision_vector}
+\end{equation}
+where $V = 2 + K + 2 = 15$ (with $K=11$ travel modes), and:
+\begin{itemize}
+    \item $s_{m,t},\, e_{m,t}$: start and end time in z-score normalization ($\mu = 12.946$~h, $\sigma = 4.691$~h),
+    \item $p^{\mathrm{mode}}_{m,t,k}$: probability of travel mode~$k$, forming a simplex $\sum_{k=1}^K p^{\mathrm{mode}}_{m,t,k} = 1$,
+    \item $j_{m,t}$: joint travel probability ($\in [\varepsilon, 1-\varepsilon]$),
+    \item $d_{m,t}$: driver probability ($\in [\varepsilon, 1-\varepsilon]$), where $\varepsilon = 10^{-3}$.
+\end{itemize}
+
+The full family decision vector is obtained by concatenating all per-member, per-activity vectors:
+\begin{equation}
+    \mathbf{x} = \bigl[\, \mathbf{x}_{1,1}, \dots, \mathbf{x}_{1,T}, \dots, \mathbf{x}_{M,1}, \dots, \mathbf{x}_{M,T} \,\bigr] \in \R^n, \quad n = M \times T \times V.
+    \label{eq:full_vector}
+\end{equation}
+
+
+%% ====================================================================
+\section{Utility Function}
+%% ====================================================================
+
+The utility of member~$m$ is defined as:
+\begin{equation}
+\begin{split}
+    U_m(\mathbf{x}) ={} & \beta_0
+    + \alpha_{\mathrm{social}} \sum_{t=1}^{T} \tilde{o}_{m,t} \, a_{m,t}
+    + \alpha_{\mathrm{joint}} \sum_{t=1}^{T} j_{m,t} \, a_{m,t} \\
+    & + \theta_{\mathrm{escort}} \sum_{t=1}^{T} d_{m,t} \,(e_{m,t} - s_{m,t})\, a_{m,t} \, \indicator_{\mathrm{adult}}(m) \\
+    & + \sum_{t=1}^{T} \tilde{o}_{m,t} \left( \sum_{k=1}^{K} p^{\mathrm{mode}}_{m,t,k} \, \theta_{\mathrm{travel},k} \, \E[\mathrm{TT}_{m,t,k}] \right) a_{m,t},
+\end{split}
+    \label{eq:utility}
+\end{equation}
+where:
+\begin{itemize}
+    \item $\beta_0$: learnable baseline utility,
+    \item $\alpha_{\mathrm{social}}$: learnable social (out-of-home) preference weight,
+    \item $\alpha_{\mathrm{joint}}$: learnable joint travel preference weight,
+    \item $\theta_{\mathrm{escort}}$: learnable escort burden coefficient (typically negative),
+    \item $\theta_{\mathrm{travel},k}$: learnable mode-specific travel time disutility (vector of length $K$),
+    \item $\tilde{o}_{m,t} = 1 - P(\mathrm{dest}_{m,t} = \mathrm{home})$: out-of-home probability from the destination head (fixed, not optimized),
+    \item $\E[\mathrm{TT}_{m,t,k}]$: expected travel time for mode~$k$ at activity~$t$, derived from the travel time matrix and destination probabilities (fixed),
+    \item $a_{m,t}$: activity validity mask ($1$ if activity~$t$ of member~$m$ is valid, $0$ otherwise),
+    \item $\indicator_{\mathrm{adult}}(m)$: indicator for adult members.
+\end{itemize}
+
+\paragraph{Lower bound.}
+To ensure positivity for the log-utility in the Nash welfare function, a smooth lower bound is applied:
+\begin{equation}
+    U_m \leftarrow U_m + \softplus(1 - U_m),
+    \label{eq:utility_lb}
+\end{equation}
+where $\softplus(z) = \log(1 + e^z)$.
+This guarantees $U_m \geq 1$ smoothly without gradient discontinuity.
+Utilities of invalid members are set to $\beta_0$ to avoid affecting the Nash objective.
+
+
+%% ====================================================================
+\section{Nash Welfare Objective}
+%% ====================================================================
+
+The Nash Bargaining solution maximizes the product of member utilities, equivalently the sum of log-utilities:
+\begin{equation}
+    \max_{\mathbf{x}} \; W(\mathbf{x}) = \sum_{m=1}^{M} \log U_m(\mathbf{x}).
+    \label{eq:nash_welfare}
+\end{equation}
+The objective $W(\mathbf{x})$ is \textbf{nonlinear}: the $\log(\cdot)$ composition is inherently nonlinear, and the escort term in $U_m$ contains the bilinear product $d_{m,t}(e_{m,t} - s_{m,t})$.
+
+
+%% ====================================================================
+\section{Phase~1: Nonlinear Program}
+\label{sec:phase1}
+%% ====================================================================
+
+Phase~1 solves the full nonlinear program (NLP) to find a converged point $\xconv$.
+
+\subsection{Optimization Problem}
+
+\begin{equation}
+    \max_{\mathbf{x}} \; W(\mathbf{x}) = \sum_{m=1}^{M} \log U_m(\mathbf{x})
+    \label{eq:nlp_obj}
+\end{equation}
+subject to the constraints in Table~\ref{tab:phase1_constraints}.
+
+\begin{table}[ht]
+\centering
+\caption{Phase~1 constraints in variable space $\mathbf{x}$.}
+\label{tab:phase1_constraints}
+\begin{tabular}{@{}llc@{}}
+\toprule
+Constraint & Formulation & Type \\
+\midrule
+(C1) Variable bounds &
+    $x_i^{\mathrm{lb}} \leq x_i \leq x_i^{\mathrm{ub}}$ & Linear \\[4pt]
+(C2) Time ordering &
+    $e_{m,t} \geq s_{m,t}, \;\; s_{m,t+1} \geq e_{m,t}$ & Linear \\[4pt]
+(C3) Mode simplex &
+    $\sum_{k=1}^{K} p^{\mathrm{mode}}_{m,t,k} = 1$ & Linear \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The variable bounds (C1) are:
+\begin{align}
+    s_{m,t},\, e_{m,t} &\in [z_{\min}, z_{\max}], \quad z_{\min} = \frac{1 - \mu}{\sigma},\; z_{\max} = \frac{24 - \mu}{\sigma}, \\
+    p^{\mathrm{mode}}_{m,t,k} &\in [\varepsilon, 1 - \varepsilon], \\
+    j_{m,t},\, d_{m,t} &\in [\varepsilon, 1 - \varepsilon].
+\end{align}
+
+\paragraph{Scope of Phase~1 constraints.}
+Phase~1 handles only the simple per-variable and per-activity constraints (C1--C3) via projection.
+More complex family-level coordination constraints---vehicle capacity and joint travel consistency---involve nonlinear coupling between members and are \emph{not} enforced during Phase~1.
+These constraints are introduced in Phase~2 (\S\ref{sec:phase2}), where they are linearized at $\xconv$ and incorporated as explicit linear constraints in the QP formulation.
+
+\subsection{SQP Algorithm}
+
+Phase~1 solves the NLP using Sequential Quadratic Programming (SQP) with BFGS inverse Hessian approximation. The constraints (C1--C3) are handled via projection after each step.
+
+\begin{algorithm}[ht]
+\caption{Phase~1: SQP with BFGS and Armijo Line Search}
+\label{alg:sqp}
+\begin{algorithmic}[1]
+\Require Decoder output $\thetapacked$, masks, utility parameters
+\Ensure Converged point $\xconv$
+
+\State $\mathbf{x} \gets \thetapacked$ \Comment{Initialize at decoder output}
+\State $H \gets I$ \Comment{Initial inverse Hessian approximation}
+
+\For{$i = 0, \dots, I_{\max} - 1$}
+    \State $\mathbf{g} \gets -\nabla_{\mathbf{x}} W(\mathbf{x})$ \Comment{Negative gradient of Nash welfare}
+    \If{$\|\mathbf{g}\| < \epsilon_{\mathrm{tol}}$} \textbf{break} \Comment{Converged} \EndIf
+
+    \If{$i > 0$}
+        \State $\mathbf{s} \gets \mathbf{x}^{(i)} - \mathbf{x}^{(i-1)}$, \quad $\mathbf{y} \gets \mathbf{g}^{(i)} - \mathbf{g}^{(i-1)}$
+        \State $H \gets \textsc{BFGS-Update}(H, \mathbf{s}, \mathbf{y})$ \Comment{With Powell's damping}
+    \EndIf
+
+    \State $\mathbf{p} \gets -(H + \delta I) \, \mathbf{g}$ \Comment{Search direction; $\delta = 10^{-3}$}
+    \State $\alpha \gets \textsc{Armijo-Search}(\mathbf{x}, \mathbf{p})$ \Comment{Backtracking line search}
+    \State $\mathbf{x} \gets \textsc{Project}(\mathbf{x} + \alpha\, \mathbf{p})$ \Comment{Project onto (C1)--(C3)}
+\EndFor
+
+\State \Return $\xconv \gets \mathbf{x}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{BFGS inverse Hessian update with Powell's damping.}
+The matrix $H$ approximates $[\nabla^2(-W)]^{-1}$, updated via the damped BFGS formula.
+Given step $\mathbf{s} = \mathbf{x}^{(i)} - \mathbf{x}^{(i-1)}$ and gradient change $\mathbf{y} = \mathbf{g}^{(i)} - \mathbf{g}^{(i-1)}$:
+\begin{enumerate}
+    \item If $\mathbf{s}^\top \mathbf{y} < 0.2\, \mathbf{s}^\top H \mathbf{s}$, apply Powell's damping:
+    \begin{equation}
+        \phi = \frac{0.8\, \mathbf{s}^\top H \mathbf{s}}{\mathbf{s}^\top H \mathbf{s} - \mathbf{s}^\top \mathbf{y}}, \quad
+        \mathbf{y}_d = \phi\, \mathbf{y} + (1-\phi)\, H \mathbf{s}.
+    \end{equation}
+    Otherwise $\mathbf{y}_d = \mathbf{y}$.
+    \item Apply the BFGS update:
+    \begin{equation}
+        H^+ = \left(I - \rho\, \mathbf{s}\, \mathbf{y}_d^\top\right) H \left(I - \rho\, \mathbf{y}_d\, \mathbf{s}^\top\right) + \rho\, \mathbf{s}\, \mathbf{s}^\top,
+        \quad \rho = \frac{1}{\mathbf{s}^\top \mathbf{y}_d}.
+        \label{eq:bfgs}
+    \end{equation}
+\end{enumerate}
+
+\paragraph{Armijo line search.}
+Starting from $\alpha = 1$, backtrack with factor $0.5$ until the sufficient decrease condition holds:
+\begin{equation}
+    -W\!\bigl(\textsc{Project}(\mathbf{x} + \alpha\, \mathbf{p})\bigr) < -W(\mathbf{x}) - c\, \alpha \|\mathbf{p}\|^2,
+    \label{eq:armijo}
+\end{equation}
+where $c = 10^{-4}$ is the Armijo parameter.
+
+\paragraph{Projection.}
+The projection operator $\textsc{Project}(\cdot)$ enforces the linear constraints (C1)--(C3):
+\begin{enumerate}
+    \item Clamp times: $s_{m,t}, e_{m,t} \in [z_{\min}, z_{\max}]$.
+    \item Enforce temporal ordering: for $t = 1, \dots, T$ sequentially, set $s_{m,t} \geq e_{m,t-1}$ and $e_{m,t} \geq s_{m,t}$.
+    \item Project mode probabilities onto the simplex: clamp to $[\varepsilon, \infty)$ and renormalize.
+    \item Clamp $j_{m,t}, d_{m,t} \in [\varepsilon, 1-\varepsilon]$.
+\end{enumerate}
+
+
+%% ====================================================================
+\section{Phase~2: Quadratic Program}
+\label{sec:phase2}
+%% ====================================================================
+
+Phase~2 constructs a QP around the converged point $\xconv$ from Phase~1.
+The displacement variable is $\mathbf{d} = \mathbf{x} - \xconv$.
+The QP enforces two groups of constraints: (i)~the Phase~1 constraints (C1--C3) re-expressed in the displacement space, and (ii)~\textbf{new} family-level coordination constraints (C4--C5) that are introduced for the first time in Phase~2.
+
+\subsection{QP Formulation}
+
+\begin{equation}
+    \min_{\mathbf{d}} \; \frac{1}{2} \mathbf{d}^\top Q \mathbf{d} + \mathbf{p}^\top \mathbf{d}
+    \quad \text{s.t.} \quad
+    G\mathbf{d} \leq \mathbf{h}, \quad
+    A\mathbf{d} = \mathbf{b}.
+    \label{eq:qp}
+\end{equation}
+
+\paragraph{Quadratic term $Q$.}
+$Q$ is a diagonal matrix encoding the Nash Hessian approximation plus anchor regularization:
+\begin{equation}
+    Q = \mathrm{diag}\!\left(\frac{1}{U_m^2} + \lambda\right)_{i},
+    \label{eq:Q}
+\end{equation}
+where $U_m$ is the utility of member $m$ evaluated at $\xconv$ (Eq.~\ref{eq:utility}), the index $i$ maps to member $m$ via the variable layout, and $\lambda$ is the fixed anchor weight.
+The term $1/U_m^2$ approximates the diagonal of the Nash welfare Hessian $\nabla^2 W$, and $\lambda$ penalizes deviation from the decoder output $\thetapacked$.
+
+\paragraph{Linear term $\mathbf{p}$.}
+\begin{equation}
+    \mathbf{p} = \lambda \left(\xconv - \thetapacked\right),
+    \label{eq:p}
+\end{equation}
+where $\thetapacked$ is the decoder output. This term anchors the QP solution toward $\thetapacked$.
+
+\paragraph{Nash correction weight.}
+The relative influence of Nash coordination versus decoder fidelity is:
+\begin{equation}
+    \gamma_{\mathrm{Nash}} = \frac{1/U_m^2}{1/U_m^2 + \lambda}.
+    \label{eq:correction_weight}
+\end{equation}
+
+\subsection{Inequality Constraints: $G\mathbf{d} \leq \mathbf{h}$}
+
+\subsubsection*{Inherited from Phase~1 (re-expressed in $\mathbf{d}$)}
+
+\paragraph{(C1$'$) Variable bounds.}
+Each variable must stay within its feasible range:
+\begin{equation}
+    -d_i \leq x_i^{\mathrm{conv}} - x_i^{\mathrm{lb}}, \quad d_i \leq x_i^{\mathrm{ub}} - x_i^{\mathrm{conv}}.
+    \label{eq:bounds_d}
+\end{equation}
+This yields $2n$ inequality rows.
+
+\paragraph{(C2$'$) Time ordering.}
+The temporal constraints $e_{m,t} \geq s_{m,t}$ and $s_{m,t+1} \geq e_{m,t}$ become:
+\begin{align}
+    d_{s_{m,t}} - d_{e_{m,t}} &\leq e^{\mathrm{conv}}_{m,t} - s^{\mathrm{conv}}_{m,t}, \label{eq:time_d1} \\
+    d_{e_{m,t}} - d_{s_{m,t+1}} &\leq s^{\mathrm{conv}}_{m,t+1} - e^{\mathrm{conv}}_{m,t}. \label{eq:time_d2}
+\end{align}
+These remain linear, as in Phase~1.
+
+\subsubsection*{New family-level coordination constraints (introduced in Phase~2)}
+
+\paragraph{(C4) Vehicle capacity.}
+This constraint is introduced for the first time in Phase~2.
+The vehicle capacity constraint $\sum_{m,t} d_{m,t} \cdot p^{\mathrm{car}}_{m,t} \cdot \indicator_{\mathrm{adult}}(m) \cdot a_{m,t} \leq n_{\mathrm{veh}}$ involves the bilinear product $d_{m,t} \cdot p^{\mathrm{car}}_{m,t}$ (both are decision variables), which cannot be directly included in a QP.
+It is linearized via first-order Taylor expansion around $\xconv$:
+\begin{equation}
+    \sum_{m,t} \left( p^{\mathrm{car},0}_{m,t} \, \Delta d_{m,t} + d^{0}_{m,t} \, \Delta p^{\mathrm{car}}_{m,t} \right) \indicator_{\mathrm{adult}}(m) \, a_{m,t}
+    \leq n_{\mathrm{veh}} - \sum_{m,t} d^0_{m,t} \, p^{\mathrm{car},0}_{m,t} \, \indicator_{\mathrm{adult}}(m) \, a_{m,t},
+    \label{eq:vehicle_d}
+\end{equation}
+where superscript~$0$ denotes values at $\xconv$, and $\Delta$ denotes the displacement component.
+This linearization is valid locally around $\xconv$, which is why this constraint is enforced in Phase~2 (after convergence) rather than Phase~1.
+It contributes a single linear inequality row.
+
+\subsection{Equality Constraints: $A\mathbf{d} = \mathbf{b}$}
+
+\subsubsection*{Inherited from Phase~1 (re-expressed in $\mathbf{d}$)}
+
+\paragraph{(C3$'$) Mode probability normalization.}
+Since $\sum_k p^{\mathrm{mode}}_{m,t,k} = 1$ holds at $\xconv$, the displacement must preserve this:
+\begin{equation}
+    \sum_{k=1}^{K} \Delta p^{\mathrm{mode}}_{m,t,k} = 0, \quad \forall\, m, t.
+    \label{eq:mode_norm_d}
+\end{equation}
+
+\subsubsection*{New family-level coordination constraint (introduced in Phase~2)}
+
+\paragraph{(C5) Joint travel consistency.}
+This constraint is introduced for the first time in Phase~2.
+When two members $m_1, m_2$ are both engaged in joint travel at activity~$t$, their activity attributes should agree.
+The activation is determined by a sigmoid gate evaluated at $\xconv$ and fixed as a binary decision:
+\begin{equation}
+    w_{m_1,m_2,t} = \indicator\!\bigl[\sigma\!\bigl(10(j_{m_1,t}^0 \cdot j_{m_2,t}^0 - \tau)\bigr) > 0.1\bigr],
+    \label{eq:joint_gate_d}
+\end{equation}
+where $\tau = 0.5$ is the joint consistency threshold, $\sigma(\cdot)$ is the sigmoid function, and superscript $0$ denotes values at $\xconv$.
+The sigmoid of the bilinear product $j_{m_1,t} \cdot j_{m_2,t}$ is inherently nonlinear; evaluating it at $\xconv$ and fixing the result as a binary gate converts this into a fixed set of linear equalities suitable for the QP.
+
+For each active pair ($w_{m_1,m_2,t} = 1$):
+\begin{align}
+    \Delta s_{m_1,t} - \Delta s_{m_2,t} &= s^0_{m_2,t} - s^0_{m_1,t}, \label{eq:joint_start_d}\\
+    \Delta e_{m_1,t} - \Delta e_{m_2,t} &= e^0_{m_2,t} - e^0_{m_1,t}, \label{eq:joint_end_d}\\
+    \Delta p^{\mathrm{mode}}_{m_1,t,k} - \Delta p^{\mathrm{mode}}_{m_2,t,k} &= p^{\mathrm{mode},0}_{m_2,t,k} - p^{\mathrm{mode},0}_{m_1,t,k}, \quad \forall\, k, \label{eq:joint_mode_d}\\
+    \Delta j_{m_1,t} - \Delta j_{m_2,t} &= j^0_{m_2,t} - j^0_{m_1,t}. \label{eq:joint_prob_d}
+\end{align}
+Each active pair contributes $2 + K + 1 = 14$ equality rows.
+Note that the right-hand sides drive the paired variables toward agreement: if the pair is active and the values differ at $\xconv$, the QP will force them to converge.
+
+\subsection{Phase~1 $\to$ Phase~2 Connection}
+
+Table~\ref{tab:linearization} summarizes the full constraint set in Phase~2.
+
+\begin{table}[ht]
+\centering
+\caption{Phase~2 constraint summary. Constraints C1--C3 are inherited from Phase~1; C4--C5 are new in Phase~2.}
+\label{tab:linearization}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Constraint & Phase~2 form & Origin & Linearization method \\
+\midrule
+(C1$'$) Bounds & $G\mathbf{d} \leq \mathbf{h}$ & Phase~1 & Direct translation \\
+(C2$'$) Time ordering & $G\mathbf{d} \leq \mathbf{h}$ & Phase~1 & Direct translation \\
+(C3$'$) Mode simplex & $A\mathbf{d} = \mathbf{b}$ & Phase~1 & Conservation (zero-sum) \\
+(C4) Vehicle capacity & $G\mathbf{d} \leq \mathbf{h}$ & \textbf{New in Phase~2} & Taylor expansion at $\xconv$ \\
+(C5) Joint consistency & $A\mathbf{d} = \mathbf{b}$ & \textbf{New in Phase~2} & Sigmoid gate fixed at $\xconv$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{QP Solve}
+
+\begin{algorithm}[ht]
+\caption{Phase~2: QP Solve with Gradient Re-attachment}
+\label{alg:optnet}
+\begin{algorithmic}[1]
+\Require $\xconv$, $\thetapacked$ (decoder output), masks, utility parameters
+\Ensure $\xfinal$ (with gradient to decoder and utility parameters)
+
+\Statex \textbf{--- Step 1: Construct QP parameters ---}
+\State $U_m \gets$ Eq.~\eqref{eq:utility} evaluated at $\xconv$
+\State $Q_{\mathrm{diag}} \gets 1/U_m^2 + \lambda$ \quad (expanded per variable via member mapping) \Comment{Eq.~\eqref{eq:Q}}
+\State $\mathbf{p} \gets \lambda(\xconv - \thetapacked)$ \Comment{Eq.~\eqref{eq:p}}
+
+\Statex \textbf{--- Step 2: Build constraints (C1$'$--C3$'$ inherited) ---}
+\State $(G, \mathbf{h}) \gets$ Eqs.~\eqref{eq:bounds_d}--\eqref{eq:vehicle_d} \Comment{C1$'$, C2$'$}
+\State $(A, \mathbf{b}) \gets$ Eqs.~\eqref{eq:mode_norm_d}--\eqref{eq:joint_prob_d} \Comment{C3$'$}
+
+\Statex \textbf{--- Step 3: Solve QP ---}
+\State $\mathbf{d}^* \gets \arg\min_{\mathbf{d}} \; \tfrac{1}{2} \mathbf{d}^\top Q \mathbf{d} + \mathbf{p}^\top \mathbf{d} \;\;\text{s.t.}\;\; G\mathbf{d} \leq \mathbf{h},\; A\mathbf{d} = \mathbf{b}$
+
+\Statex \textbf{--- Step 4: Re-attach gradient ---}
+\State $\mathbf{d}^* \gets \textsc{DiagonalKKTBackward}(\mathbf{p}, Q_{\mathrm{diag}}, \mathbf{d}^*)$ \Comment{See \S\ref{sec:kkt_backward}}
+
+\Statex \textbf{--- Step 5: Assemble final output ---}
+\State $\xfinal \gets \thetapacked + (\xconv - \thetapacked)_{\mathrm{detach}} + \mathbf{d}^*$ \Comment{Eq.~\eqref{eq:x_final}}
+\State $\xfinal \gets \textsc{Project}(\xfinal)$
+
+\State \Return $\xfinal$
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsection{Final Solution Assembly}
+
+The final output is composed as:
+\begin{equation}
+    \xfinal = \thetapacked + \underbrace{(\xconv - \thetapacked)}_{\text{no gradient}} + \underbrace{\mathbf{d}^*(\thetapacked, Q)}_{\text{carries gradient}},
+    \label{eq:x_final}
+\end{equation}
+where the SQP displacement $(\xconv - \thetapacked)$ is treated as a constant (no gradient flows through Phase~1), and $\mathbf{d}^*$ depends on $\thetapacked$ through $\mathbf{p}$ (Eq.~\ref{eq:p}) and on utility parameters through $Q$ (Eq.~\ref{eq:Q}).
+
+
+\subsection{Diagonal KKT Backward}
+\label{sec:kkt_backward}
+
+For the diagonal QP $\min_{\mathbf{d}} \frac{1}{2}\mathbf{d}^\top \mathrm{diag}(Q_{\mathrm{diag}})\, \mathbf{d} + \mathbf{p}^\top \mathbf{d}$, the unconstrained closed-form solution is $\mathbf{d}^* = -\mathbf{p} / Q_{\mathrm{diag}}$.
+We use this diagonal structure to approximate the gradients of the constrained solution:
+\begin{equation}
+    \frac{\partial d^*_i}{\partial p_i} \approx -\frac{1}{Q_{\mathrm{diag},i}}, \qquad
+    \frac{\partial d^*_i}{\partial Q_{\mathrm{diag},i}} \approx -\frac{d^*_i}{Q_{\mathrm{diag},i}}.
+    \label{eq:grad_reattach}
+\end{equation}
+
+Given upstream gradient $\bar{\mathbf{d}}$ from the loss function, the gradients propagate as:
+\begin{align}
+    \bar{\mathbf{p}} &= -\bar{\mathbf{d}} \,/\, Q_{\mathrm{diag}} & &\longrightarrow \text{gradient to } \thetapacked \text{ (decoder)}, \label{eq:grad_p} \\
+    \bar{Q}_{\mathrm{diag}} &= -\bar{\mathbf{d}} \odot \mathbf{d}^* \,/\, Q_{\mathrm{diag}} & &\longrightarrow \text{gradient to utility parameters via } 1/U_m^2. \label{eq:grad_Q}
+\end{align}
+
+
+%% ====================================================================
+\section{Straight-Through Log Unpack}
+\label{sec:st_log}
+%% ====================================================================
+
+After optimization, probability variables ($p^{\mathrm{mode}}, j, d$) must be converted back to log-probabilities for the downstream cross-entropy loss.
+A naive $\log(p)$ introduces a $1/p$ factor in the gradient, causing instability for small probabilities.
+
+The straight-through log estimator is applied:
+\begin{equation}
+    \tilde{p}_k = p_k + \bigl(\log p_k - p_k\bigr)_{\mathrm{detach}},
+    \label{eq:st_log}
+\end{equation}
+so that the forward value equals $\log p_k$ while the backward gradient is the identity ($\partial \tilde{p}_k / \partial p_k = 1$).
+For binary heads (joint, driver), the scalar $p$ is expanded to $[1-p,\; p]$ before applying Eq.~\eqref{eq:st_log}.
+
+
+%% ====================================================================
+\section{Learnable Parameters}
+\label{sec:params}
+%% ====================================================================
+
+Table~\ref{tab:params} summarizes all parameters of the Nash Bargaining layer.
+
+\begin{table}[ht]
+\centering
+\caption{Parameters of the Nash Bargaining layer.}
+\label{tab:params}
+\begin{tabular}{@{}lccl@{}}
+\toprule
+Parameter & Dim & Initial Value & Description \\
+\midrule
+$\beta_0$ & 1 & 2.0 & Baseline utility \\
+$\alpha_{\mathrm{social}}$ & 1 & 0.3 & Out-of-home social preference \\
+$\alpha_{\mathrm{joint}}$ & 1 & 0.1 & Joint travel preference \\
+$\theta_{\mathrm{escort}}$ & 1 & $-0.58$ & Escort burden (adults) \\
+$\theta_{\mathrm{travel}}$ & $K{=}11$ & $[-1.5, -0.4, \dots]$ & Mode-specific travel time disutility \\
+\midrule
+$\lambda$ (fixed) & 1 & 0.3 & Anchor weight (not learned) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All learnable parameters are updated via backpropagation through the diagonal KKT backward (Eqs.~\ref{eq:grad_p}--\ref{eq:grad_Q}).
+The anchor weight $\lambda$ is a fixed hyperparameter controlling the trade-off between Nash coordination and fidelity to the decoder output.
+
+
+%% ====================================================================
+\section{Two-Phase Flow Summary}
+\label{sec:flow}
+%% ====================================================================
+
+\begin{enumerate}
+    \item \textbf{Pack}: Convert decoder predictions (logits) to probability-space vector $\thetapacked$.
+    \item \textbf{Phase~1 (SQP)}: Starting from $\mathbf{x}_0 = \thetapacked$, iterate BFGS + Armijo to find $\xconv$ (Alg.~\ref{alg:sqp}). Handles per-variable constraints (C1--C3) via projection.
+    \item \textbf{Phase~2 (QP)}: Construct QP (Eq.~\ref{eq:qp}) using $\xconv$ and $\thetapacked$. Enforces all constraints: (C1$'$--C3$'$) inherited from Phase~1, plus \textbf{new} family-level coordination constraints (C4) vehicle capacity and (C5) joint consistency, linearized at $\xconv$. Gradient flows via diagonal KKT backward (Alg.~\ref{alg:optnet}).
+    \item \textbf{Project}: Enforce feasibility on $\xfinal$.
+    \item \textbf{Unpack}: Convert back to prediction dict using straight-through log (Eq.~\ref{eq:st_log}).
+\end{enumerate}
+
+Gradient flows from loss $\to$ unpack $\to$ $\xfinal$ $\to$ $\mathbf{d}^*$ $\to$
+\begin{itemize}
+    \item $\mathbf{p} \to \thetapacked \to$ decoder parameters,
+    \item $Q_{\mathrm{diag}} \to 1/U_m^2 \to$ learnable utility parameters.
+\end{itemize}
+
+
+\end{document}
