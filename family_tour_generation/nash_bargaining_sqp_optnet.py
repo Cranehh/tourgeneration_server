@@ -85,6 +85,7 @@ class NashBargainingSQPOptNet(nn.Module):
         alpha_joint: float = 0.1,
         alpha_social: float = 0.3,
         theta_escort: float = -0.58,
+        theta_joint_cost: float = -0.5,
         utility_baseline: float = 10.0,
         lambda_anchor: float = 0.1,
         joint_consistency_threshold: float = 0.5,
@@ -113,6 +114,7 @@ class NashBargainingSQPOptNet(nn.Module):
         self.alpha_joint = nn.Parameter(torch.tensor(alpha_joint))
         self.alpha_social = nn.Parameter(torch.tensor(alpha_social))
         self.theta_escort = nn.Parameter(torch.tensor(theta_escort))
+        self.theta_joint_cost = nn.Parameter(torch.tensor(theta_joint_cost))
         self.utility_baseline = nn.Parameter(torch.tensor(utility_baseline))
 
         theta_travel_init = torch.tensor([
@@ -342,6 +344,9 @@ class NashBargainingSQPOptNet(nn.Module):
             dest_prob, home_zone, travel_time_matrix
         ).detach()
 
+        # ---- Extract decoder's original joint_prob (for constraint activation) ----
+        original_joint_prob = F.softmax(predictions['joint'], dim=-1)[..., 1].detach()  # [B, M, T]
+
         # ---- Pack decoder outputs ----
         theta_packed = self._pack_from_predictions(predictions)  # [B, n] keeps grad
         x0 = theta_packed.detach().clone()
@@ -351,7 +356,8 @@ class NashBargainingSQPOptNet(nn.Module):
         x_converged = self._sqp_phase(
             x0, var_mask, member_mask, activity_mask,
             num_vehicles, member_is_adult,
-            out_of_home_prob, expected_tt
+            out_of_home_prob, expected_tt,
+            original_joint_prob,
         )
 
         # ---- Phase 2: OptNet (gradient through theta_packed via KKT) ----
@@ -359,7 +365,8 @@ class NashBargainingSQPOptNet(nn.Module):
             x_converged, theta_packed, var_mask,
             member_mask, activity_mask,
             num_vehicles, member_is_adult,
-            out_of_home_prob, expected_tt
+            out_of_home_prob, expected_tt,
+            original_joint_prob,
         )
 
         # ---- Unpack ----
@@ -537,6 +544,9 @@ class NashBargainingSQPOptNet(nn.Module):
         # Joint utility
         U_joint = self.alpha_joint * (joint_prob * mask).sum(dim=-1)
 
+        # Joint coordination cost (quadratic, expected negative theta → interior optimum)
+        U_joint_cost = self.theta_joint_cost * (joint_prob ** 2 * mask).sum(dim=-1)
+
         # Escort utility (adults only)
         escort_time = (driver_prob * duration * mask).sum(dim=-1)
         U_escort = self.theta_escort * escort_time * member_is_adult
@@ -546,7 +556,7 @@ class NashBargainingSQPOptNet(nn.Module):
         travel_per_trip = (mode_prob * expected_tt * self.theta_travel).sum(dim=-1)  # [B,M,T]
         U_travel = (out_of_home_prob * travel_per_trip * mask).sum(dim=-1)
 
-        U_total = U + U_social + U_joint + U_escort + U_travel
+        U_total = U + U_social + U_joint + U_joint_cost + U_escort + U_travel
 
         # ---- Smooth lower bound (softplus): ensure U ≥ 1.0 ----
         U_min = 1.0
@@ -566,6 +576,7 @@ class NashBargainingSQPOptNet(nn.Module):
         x: Tensor, member_mask: Tensor, activity_mask: Tensor,
         member_is_adult: Tensor, out_of_home_prob: Tensor, expected_tt: Tensor,
         alpha_joint, alpha_social, theta_escort, utility_baseline, theta_travel,
+        theta_joint_cost,
     ) -> Tensor:
         """Same as _compute_member_utilities but takes params as args (detached).
 
@@ -585,12 +596,13 @@ class NashBargainingSQPOptNet(nn.Module):
                         device=x.device, dtype=x.dtype)
         U_social = alpha_social * (out_of_home_prob * mask).sum(dim=-1)
         U_joint = alpha_joint * (joint_prob * mask).sum(dim=-1)
+        U_joint_cost = theta_joint_cost * (joint_prob ** 2 * mask).sum(dim=-1)
         escort_time = (driver_prob * duration * mask).sum(dim=-1)
         U_escort = theta_escort * escort_time * member_is_adult
         travel_per_trip = (mode_prob * expected_tt * theta_travel).sum(dim=-1)
         U_travel = (out_of_home_prob * travel_per_trip * mask).sum(dim=-1)
 
-        U_total = U + U_social + U_joint + U_escort + U_travel
+        U_total = U + U_social + U_joint + U_joint_cost + U_escort + U_travel
         U_total = U_total + F.softplus(1.0 - U_total)
         U_total = torch.where(member_mask > 0, U_total,
                               torch.full_like(U_total, utility_baseline.item()))
@@ -617,6 +629,7 @@ class NashBargainingSQPOptNet(nn.Module):
         member_is_adult: Tensor,
         out_of_home_prob: Tensor,
         expected_tt: Tensor,
+        original_joint_prob: Optional[Tensor] = None,
     ) -> Tensor:
         """SQP iterations to find a converged point.  No gradient needed.
 
@@ -646,6 +659,7 @@ class NashBargainingSQPOptNet(nn.Module):
             theta_escort_val = self.theta_escort.detach()
             utility_baseline_val = self.utility_baseline.detach()
             theta_travel_val = self.theta_travel.detach()
+            theta_joint_cost_val = self.theta_joint_cost.detach()
 
             for _ in range(self.sqp_max_iter):
                 # ---- gradient of Nash objective (w.r.t. x only, not params) ----
@@ -657,6 +671,7 @@ class NashBargainingSQPOptNet(nn.Module):
                         member_is_adult, out_of_home_prob, expected_tt,
                         alpha_joint_val, alpha_social_val, theta_escort_val,
                         utility_baseline_val, theta_travel_val,
+                        theta_joint_cost_val,
                     )
                     nash_obj = -self._compute_nash_welfare(utilities, member_mask)
                     grad = torch.autograd.grad(nash_obj.sum(), x_var)[0]
@@ -700,11 +715,16 @@ class NashBargainingSQPOptNet(nn.Module):
                 alpha = self._line_search(
                     x, d, var_mask, member_mask, activity_mask,
                     member_is_adult, out_of_home_prob, expected_tt,
+                    num_vehicles=num_vehicles, original_joint_prob=original_joint_prob,
                 )
 
                 # Update & project
                 x = x + alpha * d * var_mask
-                x = self._project_to_feasible(x)
+                x = self._project_to_feasible(
+                    x, num_vehicles=num_vehicles, member_is_adult=member_is_adult,
+                    activity_mask=activity_mask, original_joint_prob=original_joint_prob,
+                    member_mask=member_mask,
+                )
 
                 # NaN fallback → reset to x0 (SQP did 0 steps, OptNet still valid)
                 if torch.isnan(x).any():
@@ -776,6 +796,7 @@ class NashBargainingSQPOptNet(nn.Module):
     def _line_search(
         self, x, d, var_mask, member_mask, activity_mask,
         member_is_adult, out_of_home_prob, expected_tt,
+        num_vehicles=None, original_joint_prob=None,
     ) -> Tensor:
         """Armijo backtracking line search."""
         B = x.shape[0]
@@ -790,7 +811,12 @@ class NashBargainingSQPOptNet(nn.Module):
         alpha = torch.ones(B, 1, device=device)
 
         for _ in range(10):
-            x_new = self._project_to_feasible(x + alpha * d * var_mask)
+            x_new = self._project_to_feasible(
+                x + alpha * d * var_mask,
+                num_vehicles=num_vehicles, member_is_adult=member_is_adult,
+                activity_mask=activity_mask, original_joint_prob=original_joint_prob,
+                member_mask=member_mask,
+            )
             utils_new = self._compute_member_utilities(
                 x_new, member_mask, activity_mask, member_is_adult,
                 out_of_home_prob, expected_tt,
@@ -806,15 +832,24 @@ class NashBargainingSQPOptNet(nn.Module):
 
         return alpha
 
-    def _project_to_feasible(self, x: Tensor) -> Tensor:
-        """Project to feasible region (bounds + simplex + ordering).
+    def _project_to_feasible(
+        self, x: Tensor,
+        num_vehicles: Optional[Tensor] = None,
+        member_is_adult: Optional[Tensor] = None,
+        activity_mask: Optional[Tensor] = None,
+        original_joint_prob: Optional[Tensor] = None,
+        member_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Project to feasible region (bounds + simplex + ordering + vehicle + joint).
 
         Fully non-in-place: safe to call on tensors in the autograd graph.
+        New optional params enable vehicle and joint consistency projections.
         """
         B = x.shape[0]
         K = self.num_modes
         T = self.max_activities
-        x_4d = x.reshape(B, self.max_members, T, self.vars_per_activity)
+        M = self.max_members
+        x_4d = x.reshape(B, M, T, self.vars_per_activity)
 
         # Time bounds with sequential ordering (non-in-place via list + stack)
         start_raw = x_4d[..., 0].clamp(self.z_min, self.z_max)  # [B, M, T]
@@ -843,6 +878,73 @@ class NashBargainingSQPOptNet(nn.Module):
         joint_prob  = x_4d[..., 2+K].clamp(self.eps, 1 - self.eps)
         driver_prob = x_4d[..., 2+K+1].clamp(self.eps, 1 - self.eps)
 
+        # ---- Vehicle constraint projection ----
+        if num_vehicles is not None and member_is_adult is not None and activity_mask is not None:
+            car_idx = self.car_mode_indices[0]
+            car_prob = mode_prob[..., car_idx]  # [B, M, T]
+            usage = (driver_prob * car_prob * member_is_adult.unsqueeze(-1) * activity_mask).sum(dim=(1, 2))  # [B]
+            scale = (num_vehicles / usage.clamp(min=1e-6)).clamp(max=1.0)  # [B]
+            driver_prob = driver_prob * scale[:, None, None]
+            driver_prob = driver_prob.clamp(self.eps, 1 - self.eps)
+
+        # ---- Joint consistency projection (2-person families only) ----
+        if original_joint_prob is not None and member_mask is not None and activity_mask is not None:
+            num_members = member_mask.sum(dim=-1)  # [B]
+            is_two_person = (num_members == 2).float()  # [B]
+
+            if is_two_person.any():
+                for t_idx in range(T):
+                    # Check if both members are jointly active at this time step
+                    jp0 = original_joint_prob[:, 0, t_idx]  # [B]
+                    jp1 = original_joint_prob[:, 1, t_idx]  # [B]
+                    active = (jp0 * jp1 > self.joint_consistency_threshold).float() * is_two_person  # [B]
+
+                    if active.any():
+                        a = active[:, None]  # [B, 1] for broadcasting
+
+                        # Average start/end times
+                        avg_start = (start[:, 0, t_idx] + start[:, 1, t_idx]) / 2  # [B]
+                        avg_end = (end[:, 0, t_idx] + end[:, 1, t_idx]) / 2
+
+                        # Build new start/end via blending (non-in-place)
+                        s0 = start[:, 0, t_idx] * (1 - active) + avg_start * active
+                        s1 = start[:, 1, t_idx] * (1 - active) + avg_start * active
+                        e0 = end[:, 0, t_idx] * (1 - active) + avg_end * active
+                        e1 = end[:, 1, t_idx] * (1 - active) + avg_end * active
+
+                        # Rebuild start/end tensors (non-in-place via list)
+                        start_slices = [start[:, m, t_idx] if m >= 2 else (s0 if m == 0 else s1) for m in range(M)]
+                        end_slices = [end[:, m, t_idx] if m >= 2 else (e0 if m == 0 else e1) for m in range(M)]
+                        start = torch.cat([
+                            start[..., :t_idx],
+                            torch.stack(start_slices, dim=1).unsqueeze(-1),
+                            start[..., t_idx+1:],
+                        ], dim=-1)
+                        end = torch.cat([
+                            end[..., :t_idx],
+                            torch.stack(end_slices, dim=1).unsqueeze(-1),
+                            end[..., t_idx+1:],
+                        ], dim=-1)
+
+                        # Average mode probabilities and renormalize
+                        avg_mode = (mode_prob[:, 0, t_idx, :] + mode_prob[:, 1, t_idx, :]) / 2  # [B, K]
+                        avg_mode = avg_mode / avg_mode.sum(dim=-1, keepdim=True)
+                        m0 = mode_prob[:, 0, t_idx, :] * (1 - a) + avg_mode * a
+                        m1 = mode_prob[:, 1, t_idx, :] * (1 - a) + avg_mode * a
+                        mode_slices = []
+                        for m in range(M):
+                            if m == 0:
+                                mode_slices.append(m0)
+                            elif m == 1:
+                                mode_slices.append(m1)
+                            else:
+                                mode_slices.append(mode_prob[:, m, t_idx, :])
+                        mode_prob = torch.cat([
+                            mode_prob[..., :t_idx, :],
+                            torch.stack(mode_slices, dim=1).unsqueeze(2),
+                            mode_prob[..., t_idx+1:, :],
+                        ], dim=2)
+
         x_proj = torch.cat([
             start.unsqueeze(-1),
             end.unsqueeze(-1),
@@ -868,6 +970,7 @@ class NashBargainingSQPOptNet(nn.Module):
         member_is_adult: Tensor,
         out_of_home_prob: Tensor,
         expected_tt: Tensor,
+        original_joint_prob: Optional[Tensor] = None,
     ) -> Tensor:
         """OptNet phase: solve reduced-dimension QP with gradient through θ_packed.
 
@@ -908,6 +1011,7 @@ class NashBargainingSQPOptNet(nn.Module):
             x_converged, var_mask, member_mask, activity_mask,
             num_vehicles, member_is_adult,
             valid_idx=valid_idx, n_valid=n_valid,
+            original_joint_prob=original_joint_prob,
         )
 
         # ---- Reduce Q and p to valid variables ----
@@ -990,7 +1094,11 @@ class NashBargainingSQPOptNet(nn.Module):
         if torch.isnan(x_final).any():
             x_final = theta_packed  # Fallback: skip Nash adjustment
 
-        x_final = self._project_to_feasible(x_final)
+        x_final = self._project_to_feasible(
+            x_final, num_vehicles=num_vehicles, member_is_adult=member_is_adult,
+            activity_mask=activity_mask, original_joint_prob=original_joint_prob,
+            member_mask=member_mask,
+        )
 
         return x_final
 
@@ -1008,6 +1116,7 @@ class NashBargainingSQPOptNet(nn.Module):
         member_is_adult: Tensor,  # [B, M]
         valid_idx: Tensor,        # [n] bool mask for valid variables
         n_valid: int,             # number of valid variables
+        original_joint_prob: Optional[Tensor] = None,  # [B, M, T] from decoder
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Build QP constraints directly in reduced dimension — zero Python loops.
 
@@ -1105,7 +1214,8 @@ class NashBargainingSQPOptNet(nn.Module):
 
         # ---- 5. Joint travel consistency (pre-filter active pairs) ----
         if self.num_pairs > 0:
-            joint_prob_conv = x_4d[..., 2 + K]  # [B, M, T]
+            # Use decoder's original joint_prob for activation gate (more stable than optimized x)
+            joint_prob_conv = original_joint_prob if original_joint_prob is not None else x_4d[..., 2 + K]  # [B, M, T]
 
             # Compute activation for all pairs at once
             jp_m1 = joint_prob_conv[:, self.pair_m1, self.pair_t]  # [B, num_pairs]
@@ -1191,6 +1301,7 @@ def create_nash_layer_from_config(config) -> NashBargainingSQPOptNet:
         alpha_joint=nc.get('alpha_joint', 0.1),
         alpha_social=nc.get('alpha_social', 0.3),
         theta_escort=nc.get('theta_escort', -0.58),
+        theta_joint_cost=nc.get('theta_joint_cost', -0.5),
         utility_baseline=nc.get('utility_baseline', 10.0),
         lambda_anchor=nc.get('lambda_anchor', 0.1),
         joint_consistency_threshold=nc.get('joint_consistency_threshold', 0.5),

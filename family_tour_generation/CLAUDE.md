@@ -65,7 +65,7 @@ Does NOT modify: `purpose`, `destination`, `end` token.
    - `∂d*/∂p ≈ -1/Q_diag` → gradient to `θ_packed` (decoder)
    - `∂d*/∂Q_diag ≈ -d*/Q_diag` → gradient to utility params
    - `x_final = θ_packed + (x_converged − θ_packed).detach() + d*(θ_packed)`
-   - Learnable params updated: `alpha_joint`, `alpha_social`, `theta_escort`, `utility_baseline`, `theta_travel`
+   - Learnable params updated: `alpha_joint`, `alpha_social`, `theta_escort`, `theta_joint_cost`, `utility_baseline`, `theta_travel`
 
 **Constraint structure**:
 - Inequality: bound constraints + time ordering (end≥start, start(t+1)≥end(t)) + vehicle constraint (linearised bilinear)
@@ -84,13 +84,16 @@ Does NOT modify: `purpose`, `destination`, `end` token.
 - Mode logits clamped to `[-7.0, ∞)` on unpack to prevent `log(0)` in AMP
 - Rollout skipped during Nash warm-up (first 10 epochs after `nash_bargaining_start_epoch`) to avoid conflicting gradients
 
-**`_project_to_feasible`**: Fully non-in-place implementation using list+stack for time ordering. Safe to call on tensors in the autograd graph (the old in-place version caused `RuntimeError: inplace operation` during backward).
+**`_project_to_feasible`**: Fully non-in-place implementation using list+stack for time ordering. Safe to call on tensors in the autograd graph. Now also includes:
+- **Vehicle constraint projection**: scales down `driver_prob` when `Σ(driver×car×adult×mask) > num_vehicles`
+- **Joint consistency projection**: for 2-person families, averages start/end/mode for active joint pairs (3+ person families handled by OptNet equality constraints)
+- All new projections are optional (backward-compatible signature with `Optional` params)
 
 **`_DiagonalQPBackward`**: Custom `torch.autograd.Function` replacing qpth's KKT backward. QPFunction runs under `no_grad()` (correct constrained solution), then `_DiagonalQPBackward.apply(p_v, Q_v_diag, d_detached)` re-attaches gradient via diagonal approximation. Eliminates qpth's C++ reference cycle memory leak (~1750 MB/batch).
 
 **Straight-through log unpack** (`_unpack_to_predictions`): Mode/joint/driver heads use `p + (log(p) - p).detach()` — forward = `log(p)` (correct loss), backward = identity (no `1/p` gradient distortion). Without this, non-target gradient for 11-class mode is ~11x too large (constant 1.0 vs proportional `p_i`).
 
-**Checkpoint compatibility**: `load_checkpoint()` in `train_with_ss_rollout.py` overrides `utility_baseline` from config after loading, since old checkpoints store the previous value (10.0) as `nn.Parameter`.
+**Checkpoint compatibility**: `load_checkpoint()` in `train_with_ss_rollout.py` overrides `utility_baseline` from config after loading, since old checkpoints store the previous value (10.0) as `nn.Parameter`. Also initializes `theta_joint_cost` if missing from old checkpoints.
 
 **QR rank filtering**: before passing to QPFunction, removes linearly dependent equality rows via `torch.linalg.qr` to prevent singular KKT systems.
 
@@ -120,6 +123,7 @@ nash_config = {
     'alpha_joint': 0.1,       # learnable, init value
     'alpha_social': 0.3,      # learnable, init value
     'theta_escort': -0.58,    # learnable, init value
+    'theta_joint_cost': -0.5, # learnable, quadratic jp cost → interior optimum jp*=0.35
     'utility_baseline': 2.0,  # learnable, init value (was 10.0 — too inert)
     'lambda_anchor': 0.3,     # soft anchor weight, fixed (was 0.1)
     'sqp_max_iter': 15,

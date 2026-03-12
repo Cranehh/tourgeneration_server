@@ -398,8 +398,15 @@ class ScheduledSamplingTrainer:
 
         # Override utility_baseline to match new config (old checkpoints have 10.0)
         if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'nash_layer') and self.model.decoder.nash_layer is not None:
-            self.model.decoder.nash_layer.utility_baseline.data.fill_(self.model_config.nash_config.get('utility_baseline', 2.0))
-            logger.info(f"Overrode nash utility_baseline to {self.model.decoder.nash_layer.utility_baseline.item():.1f}")
+            nash = self.model.decoder.nash_layer
+            nash.utility_baseline.data.fill_(self.model_config.nash_config.get('utility_baseline', 2.0))
+            logger.info(f"Overrode nash utility_baseline to {nash.utility_baseline.item():.1f}")
+
+            # Initialize theta_joint_cost if missing from old checkpoint
+            if 'decoder.nash_layer.theta_joint_cost' not in checkpoint.get('model_state_dict', {}):
+                init_val = self.model_config.nash_config.get('theta_joint_cost', -0.5)
+                nash.theta_joint_cost = nn.Parameter(torch.tensor(init_val, device=self.device))
+                logger.info(f"Initialized new theta_joint_cost={init_val} (not in checkpoint)")
 
         logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
 
@@ -562,7 +569,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_nash_without_end3',
+        save_dir='../checkpoints_ss_with_condition_nash_without_end4',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

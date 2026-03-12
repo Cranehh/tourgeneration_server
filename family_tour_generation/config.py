@@ -79,6 +79,7 @@ class ModelConfig:
         'lambda_anchor': 0.3,
         'joint_consistency_threshold': 0.5,
         'car_mode_indices': [7],
+        'theta_joint_cost': -0.5,
     })
     nash_bargaining_start_epoch: int = 3  # 从第几个epoch开始使用Nash Bargaining（调低以快速验证）
 
