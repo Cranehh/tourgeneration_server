@@ -1,25 +1,24 @@
 """
-家庭层面 Nash Bargaining 协调层 (重构版 V4)
+家庭层面 Nash Bargaining 协调层 (重构版 V5)
 基于 SQP + OptNet 的可微优化实现
 
-重构要点:
-1. 直接使用 decoder 原生输出（predictions dict）
-2. 去掉偏好惩罚项，改用 soft anchor λ·‖x-θ‖²
-3. 加入联合出行一致性硬约束
-4. 不优化 purpose, destination, end token
+V5 改进:
+1. 上下文感知效用参数 (UtilityParameterNet): MLP 根据家庭/成员属性预测效用参数
+2. 动态 Disagreement Point: decoder 原始预测效用作为 per-member baseline
+3. Constrained SQP: SQP 每步使用带约束的 QP 子问题替代无约束 Newton + 投影
 
 优化变量（每成员每活动15个）:
   [start_time(1), end_time(1), mode_prob(11), joint_prob(1), driver_prob(1)]
 
-效用函数（无偏好项）:
-  U_n = U_baseline(10.0)
-      + α_social × Σ_t out_of_home_prob(t) × mask(t)
-      + α_joint × Σ_t joint_prob(t) × mask(t)
-      + θ_escort × Σ_t driver_prob(t) × (end-start)(t) × is_adult(n) × mask(t)
+效用函数:
+  U_n = U_baseline
+      + α_social(ctx) × Σ_t out_of_home_prob(t) × mask(t)
+      + α_joint(ctx) × Σ_t joint_prob(t) × mask(t)
+      + θ_escort(ctx) × Σ_t driver_prob(t) × (end-start)(t) × is_adult(n) × mask(t)
       + Σ_t Σ_k mode_prob(t,k) × θ_travel(k) × expected_tt(t,k) × out_of_home(t) × mask(t)
 
 两阶段求解:
-  Phase 1: SQP (BFGS + Armijo) → x_converged (无梯度)
+  Phase 1: Constrained SQP (QP subproblem + Armijo) → x_converged (无梯度)
   Phase 2: OptNet QP → d* (有梯度，通过 θ_packed)
   x_final = θ_packed + (x_converged - θ_packed).detach() + d*
 
@@ -40,6 +39,86 @@ try:
 except ImportError:
     QPTH_AVAILABLE = False
     print("Warning: qpth not available. Install with: pip install qpth")
+
+
+# =============================================================================
+#                     UtilityParameterNet (改进1)
+# =============================================================================
+
+class UtilityParameterNet(nn.Module):
+    """Context-aware utility parameter prediction network.
+
+    Predicts per-activity utility parameters based on family attributes,
+    member attributes, and predicted activity purpose probabilities.
+
+    Output: 3 parameters per activity slot [B, M, T]:
+      - alpha_joint_ctx:  softplus(output[..., 0]) * 0.5
+      - alpha_social_ctx: softplus(output[..., 1]) * 0.5
+      - theta_escort_ctx: -softplus(output[..., 2])
+    """
+
+    def __init__(
+        self,
+        family_dim: int = 10,
+        member_dim: int = 51,
+        purpose_dim: int = 10,
+        hidden_dim: int = 64,
+        # Initial values matching current global parameters
+        init_alpha_joint: float = 0.1,
+        init_alpha_social: float = 0.3,
+        init_theta_escort: float = -0.58,
+    ):
+        super().__init__()
+        input_dim = family_dim + member_dim + purpose_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 3),
+        )
+
+        # Initialize biases so initial output ≈ current global parameter values
+        # softplus(x) * 0.5 ≈ target → x ≈ softplus_inv(target / 0.5) = log(exp(target/0.5) - 1)
+        with torch.no_grad():
+            # Zero out weights for near-constant initial output
+            self.net[0].weight.mul_(0.01)
+            self.net[3].weight.mul_(0.01)
+
+            bias = self.net[3].bias
+            # alpha_joint: softplus(b) * 0.5 ≈ 0.1 → b ≈ log(exp(0.2) - 1) ≈ -1.50
+            bias[0] = math.log(math.expm1(init_alpha_joint / 0.5))
+            # alpha_social: softplus(b) * 0.5 ≈ 0.3 → b ≈ log(exp(0.6) - 1) ≈ -0.58
+            bias[1] = math.log(math.expm1(init_alpha_social / 0.5))
+            # theta_escort: -softplus(b) ≈ -0.58 → b ≈ log(exp(0.58) - 1) ≈ -0.62
+            bias[2] = math.log(math.expm1(abs(init_theta_escort)))
+
+    def forward(
+        self,
+        family_attr: Tensor,   # [B, Ff]
+        member_attr: Tensor,   # [B, M, Fm]
+        purpose_prob: Tensor,  # [B, M, T, 10]
+    ) -> Dict[str, Tensor]:
+        """Predict context-aware utility parameters.
+
+        Returns dict with keys 'alpha_joint', 'alpha_social', 'theta_escort',
+        each of shape [B, M, T].
+        """
+        B, M, T, _ = purpose_prob.shape
+
+        # Expand family_attr to [B, M, T, Ff]
+        family_exp = family_attr[:, None, None, :].expand(B, M, T, -1)
+        # Expand member_attr to [B, M, T, Fm]
+        member_exp = member_attr[:, :, None, :].expand(B, M, T, -1)
+
+        # Concatenate: [B, M, T, Ff + Fm + 10]
+        x = torch.cat([family_exp, member_exp, purpose_prob], dim=-1)
+        out = self.net(x)  # [B, M, T, 3]
+
+        return {
+            'alpha_joint':  F.softplus(out[..., 0]) * 0.5,   # [B, M, T], ≈ 0.1
+            'alpha_social': F.softplus(out[..., 1]) * 0.5,   # [B, M, T], ≈ 0.3
+            'theta_escort': -F.softplus(out[..., 2]),         # [B, M, T], ≈ -0.58
+        }
 
 
 class _DiagonalQPBackward(torch.autograd.Function):
@@ -92,6 +171,13 @@ class NashBargainingSQPOptNet(nn.Module):
         car_mode_indices: list = None,
         sqp_max_iter: int = 15,
         sqp_tol: float = 1e-4,
+        # V5 new parameters
+        use_context_params: bool = True,
+        context_hidden_dim: int = 64,
+        family_dim: int = 10,
+        member_dim: int = 51,
+        use_dynamic_baseline: bool = True,
+        use_constrained_sqp: bool = True,
     ):
         super().__init__()
 
@@ -103,6 +189,11 @@ class NashBargainingSQPOptNet(nn.Module):
         self.car_mode_indices = car_mode_indices or [7]
         self.sqp_max_iter = sqp_max_iter
         self.sqp_tol = sqp_tol
+
+        # V5 feature flags
+        self.use_context_params = use_context_params
+        self.use_dynamic_baseline = use_dynamic_baseline
+        self.use_constrained_sqp = use_constrained_sqp
 
         # Variables per activity: start(1) + end(1) + mode_prob(num_modes) + joint_prob(1) + driver_prob(1)
         self.vars_per_activity = 2 + num_modes + 2
@@ -122,6 +213,18 @@ class NashBargainingSQPOptNet(nn.Module):
             -1.0, -1.0, -0.4, -1.0, -0.8, -0.5
         ][:num_modes])
         self.theta_travel = nn.Parameter(theta_travel_init)
+
+        # V5: Context-aware utility parameter network
+        if use_context_params:
+            self.utility_param_net = UtilityParameterNet(
+                family_dim=family_dim,
+                member_dim=member_dim,
+                purpose_dim=10,  # num_purposes
+                hidden_dim=context_hidden_dim,
+                init_alpha_joint=alpha_joint,
+                init_alpha_social=alpha_social,
+                init_theta_escort=theta_escort,
+            )
 
         # Time z-score bounds: mean=12.946, std=4.691
         self.time_mean = 12.946
@@ -293,6 +396,8 @@ class NashBargainingSQPOptNet(nn.Module):
         home_zone: Tensor,               # [B]
         member_is_adult: Tensor,         # [B, M]
         travel_time_matrix: Tensor,      # [Z, Z] or [Z, Z, K]
+        family_attr: Optional[Tensor] = None,   # [B, Ff] — V5 new
+        member_attr: Optional[Tensor] = None,   # [B, M, Fm] — V5 new
     ) -> Dict[str, Tensor]:
         """Forward pass. Returns modified predictions dict."""
         if not self.enabled:
@@ -304,6 +409,8 @@ class NashBargainingSQPOptNet(nn.Module):
                 k: v.float() if torch.is_tensor(v) else v
                 for k, v in predictions.items()
             }
+            fa = family_attr.float() if family_attr is not None else None
+            ma = member_attr.float() if member_attr is not None else None
             result = self._forward_impl(
                 preds_f32,
                 member_mask.float(),
@@ -312,6 +419,8 @@ class NashBargainingSQPOptNet(nn.Module):
                 home_zone,
                 member_is_adult.float(),
                 travel_time_matrix.float(),
+                family_attr=fa,
+                member_attr=ma,
             )
 
         return result
@@ -325,6 +434,8 @@ class NashBargainingSQPOptNet(nn.Module):
         home_zone: Tensor,
         member_is_adult: Tensor,
         travel_time_matrix: Tensor,
+        family_attr: Optional[Tensor] = None,
+        member_attr: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """Core implementation in float32."""
         batch_size = member_mask.shape[0]
@@ -347,10 +458,35 @@ class NashBargainingSQPOptNet(nn.Module):
         # ---- Extract decoder's original joint_prob (for constraint activation) ----
         original_joint_prob = F.softmax(predictions['joint'], dim=-1)[..., 1].detach()  # [B, M, T]
 
+        # ---- V5: Compute context-aware parameters ----
+        ctx_params = None
+        if self.use_context_params and family_attr is not None and member_attr is not None:
+            purpose_prob = F.softmax(predictions['purpose'].detach(), dim=-1)  # [B, M, T, 10]
+            ctx_params = self.utility_param_net(family_attr, member_attr, purpose_prob)
+            # ctx_params: dict with 'alpha_joint', 'alpha_social', 'theta_escort' all [B, M, T]
+
+        # ---- V5: Compute dynamic baseline (disagreement point) ----
+        dynamic_baseline = None
+        if self.use_dynamic_baseline:
+            theta_packed_for_baseline = self._pack_from_predictions(predictions)
+            dynamic_baseline = self._compute_member_utilities(
+                theta_packed_for_baseline.detach(), member_mask, activity_mask,
+                member_is_adult, out_of_home_prob, expected_tt,
+                ctx_params=ctx_params,
+            )  # [B, M]
+            # Clamp to ensure reasonable baseline (at least 1.0)
+            dynamic_baseline = dynamic_baseline.clamp(min=1.0)
+
         # ---- Pack decoder outputs ----
         theta_packed = self._pack_from_predictions(predictions)  # [B, n] keeps grad
         x0 = theta_packed.detach().clone()
         var_mask = self._build_var_mask(activity_mask)  # [B, n]
+
+        # ---- Detached ctx_params for SQP (no gradient) ----
+        ctx_params_det = None
+        if ctx_params is not None:
+            ctx_params_det = {k: v.detach() for k, v in ctx_params.items()}
+        dynamic_baseline_det = dynamic_baseline.detach() if dynamic_baseline is not None else None
 
         # ---- Phase 1: SQP (no gradient) ----
         x_converged = self._sqp_phase(
@@ -358,6 +494,8 @@ class NashBargainingSQPOptNet(nn.Module):
             num_vehicles, member_is_adult,
             out_of_home_prob, expected_tt,
             original_joint_prob,
+            ctx_params_detached=ctx_params_det,
+            dynamic_baseline_detached=dynamic_baseline_det,
         )
 
         # ---- Phase 2: OptNet (gradient through theta_packed via KKT) ----
@@ -367,6 +505,8 @@ class NashBargainingSQPOptNet(nn.Module):
             num_vehicles, member_is_adult,
             out_of_home_prob, expected_tt,
             original_joint_prob,
+            ctx_params=ctx_params,
+            dynamic_baseline=dynamic_baseline,
         )
 
         # ---- Unpack ----
@@ -522,6 +662,8 @@ class NashBargainingSQPOptNet(nn.Module):
         member_is_adult: Tensor,  # [B, M]
         out_of_home_prob: Tensor, # [B, M, T]
         expected_tt: Tensor,      # [B, M, T, K]
+        ctx_params: Optional[Dict[str, Tensor]] = None,  # V5
+        dynamic_baseline: Optional[Tensor] = None,        # V5: [B, M]
     ) -> Tensor:
         """Compute utility for each member.  Returns [B, M]."""
         unpacked = self._unpack_flat(x)
@@ -535,21 +677,36 @@ class NashBargainingSQPOptNet(nn.Module):
         mask = activity_mask  # [B, M, T]
         duration = end - start  # [B, M, T]  (z-score space)
 
-        # Baseline (expand learnable scalar to [B, M])
-        U = self.utility_baseline.expand(x.shape[0], self.max_members).clone()
+        # Baseline: use dynamic baseline if provided, else learnable scalar
+        if dynamic_baseline is not None and self.use_dynamic_baseline:
+            U = dynamic_baseline.clone()  # [B, M]
+        else:
+            U = self.utility_baseline.expand(x.shape[0], self.max_members).clone()
 
-        # Social utility
-        U_social = self.alpha_social * (out_of_home_prob * mask).sum(dim=-1)
+        # Context-aware or global parameters
+        if ctx_params is not None and self.use_context_params:
+            ctx_alpha_joint = ctx_params['alpha_joint']    # [B, M, T]
+            ctx_alpha_social = ctx_params['alpha_social']  # [B, M, T]
+            ctx_theta_escort = ctx_params['theta_escort']  # [B, M, T]
 
-        # Joint utility
-        U_joint = self.alpha_joint * (joint_prob * mask).sum(dim=-1)
+            # Social utility (per-activity alpha)
+            U_social = (ctx_alpha_social * out_of_home_prob * mask).sum(dim=-1)
+            # Joint utility (per-activity alpha)
+            U_joint = (ctx_alpha_joint * joint_prob * mask).sum(dim=-1)
+            # Escort utility (per-activity theta, adults only)
+            escort_time = (driver_prob * duration * mask)  # [B, M, T]
+            U_escort = (ctx_theta_escort * escort_time).sum(dim=-1) * member_is_adult
+        else:
+            # Social utility
+            U_social = self.alpha_social * (out_of_home_prob * mask).sum(dim=-1)
+            # Joint utility
+            U_joint = self.alpha_joint * (joint_prob * mask).sum(dim=-1)
+            # Escort utility (adults only)
+            escort_time = (driver_prob * duration * mask).sum(dim=-1)
+            U_escort = self.theta_escort * escort_time * member_is_adult
 
         # Joint coordination cost (quadratic, expected negative theta → interior optimum)
         U_joint_cost = self.theta_joint_cost * (joint_prob ** 2 * mask).sum(dim=-1)
-
-        # Escort utility (adults only)
-        escort_time = (driver_prob * duration * mask).sum(dim=-1)
-        U_escort = self.theta_escort * escort_time * member_is_adult
 
         # Travel utility
         # per-trip: Σ_k mode_prob(k) * θ_travel(k) * expected_tt(k)
@@ -577,6 +734,8 @@ class NashBargainingSQPOptNet(nn.Module):
         member_is_adult: Tensor, out_of_home_prob: Tensor, expected_tt: Tensor,
         alpha_joint, alpha_social, theta_escort, utility_baseline, theta_travel,
         theta_joint_cost,
+        ctx_params_detached: Optional[Dict[str, Tensor]] = None,  # V5
+        dynamic_baseline_detached: Optional[Tensor] = None,        # V5: [B, M]
     ) -> Tensor:
         """Same as _compute_member_utilities but takes params as args (detached).
 
@@ -592,13 +751,30 @@ class NashBargainingSQPOptNet(nn.Module):
         mask = activity_mask
         duration = end - start
 
-        U = torch.full((x.shape[0], self.max_members), utility_baseline.item(),
-                        device=x.device, dtype=x.dtype)
-        U_social = alpha_social * (out_of_home_prob * mask).sum(dim=-1)
-        U_joint = alpha_joint * (joint_prob * mask).sum(dim=-1)
+        # Baseline: dynamic or scalar
+        if dynamic_baseline_detached is not None and self.use_dynamic_baseline:
+            U = dynamic_baseline_detached.clone()  # [B, M]
+        else:
+            U = torch.full((x.shape[0], self.max_members), utility_baseline.item(),
+                            device=x.device, dtype=x.dtype)
+
+        # Context-aware or global parameters
+        if ctx_params_detached is not None and self.use_context_params:
+            ctx_aj = ctx_params_detached['alpha_joint']    # [B, M, T]
+            ctx_as = ctx_params_detached['alpha_social']   # [B, M, T]
+            ctx_te = ctx_params_detached['theta_escort']   # [B, M, T]
+
+            U_social = (ctx_as * out_of_home_prob * mask).sum(dim=-1)
+            U_joint = (ctx_aj * joint_prob * mask).sum(dim=-1)
+            escort_time = (driver_prob * duration * mask)
+            U_escort = (ctx_te * escort_time).sum(dim=-1) * member_is_adult
+        else:
+            U_social = alpha_social * (out_of_home_prob * mask).sum(dim=-1)
+            U_joint = alpha_joint * (joint_prob * mask).sum(dim=-1)
+            escort_time = (driver_prob * duration * mask).sum(dim=-1)
+            U_escort = theta_escort * escort_time * member_is_adult
+
         U_joint_cost = theta_joint_cost * (joint_prob ** 2 * mask).sum(dim=-1)
-        escort_time = (driver_prob * duration * mask).sum(dim=-1)
-        U_escort = theta_escort * escort_time * member_is_adult
         travel_per_trip = (mode_prob * expected_tt * theta_travel).sum(dim=-1)
         U_travel = (out_of_home_prob * travel_per_trip * mask).sum(dim=-1)
 
@@ -630,10 +806,13 @@ class NashBargainingSQPOptNet(nn.Module):
         out_of_home_prob: Tensor,
         expected_tt: Tensor,
         original_joint_prob: Optional[Tensor] = None,
+        ctx_params_detached: Optional[Dict[str, Tensor]] = None,  # V5
+        dynamic_baseline_detached: Optional[Tensor] = None,        # V5
     ) -> Tensor:
         """SQP iterations to find a converged point.  No gradient needed.
 
-        Solves a reduced-dimension system using only valid variables (var_mask==1).
+        V5: When use_constrained_sqp=True, each SQP step solves a constrained QP
+        subproblem instead of unconstrained Newton + projection.
         """
         B, n = x0.shape
         device = x0.device
@@ -661,6 +840,10 @@ class NashBargainingSQPOptNet(nn.Module):
             theta_travel_val = self.theta_travel.detach()
             theta_joint_cost_val = self.theta_joint_cost.detach()
 
+            # Precompute full-to-valid index mapping for constrained SQP
+            full_to_valid = torch.full((n,), -1, device=device, dtype=torch.long)
+            full_to_valid[valid_idx] = torch.arange(n_valid, device=device)
+
             for _ in range(self.sqp_max_iter):
                 # ---- gradient of Nash objective (w.r.t. x only, not params) ----
                 x_var = x.detach().clone().requires_grad_(True)
@@ -672,6 +855,8 @@ class NashBargainingSQPOptNet(nn.Module):
                         alpha_joint_val, alpha_social_val, theta_escort_val,
                         utility_baseline_val, theta_travel_val,
                         theta_joint_cost_val,
+                        ctx_params_detached=ctx_params_detached,
+                        dynamic_baseline_detached=dynamic_baseline_detached,
                     )
                     nash_obj = -self._compute_nash_welfare(utilities, member_mask)
                     grad = torch.autograd.grad(nash_obj.sum(), x_var)[0]
@@ -700,12 +885,28 @@ class NashBargainingSQPOptNet(nn.Module):
                 prev_x_v = x_v.clone()
                 prev_grad_v = grad_v.clone()
 
-                # Newton step on reduced system
-                H_reg_v = H_v + 1e-3 * torch.eye(n_valid, device=device).unsqueeze(0)
-                try:
-                    d_v = -torch.linalg.solve(H_reg_v, grad_v.unsqueeze(-1)).squeeze(-1)
-                except Exception:
-                    d_v = -grad_v / (torch.diagonal(H_reg_v, dim1=-2, dim2=-1) + 1e-6)
+                # ---- Compute search direction ----
+                if self.use_constrained_sqp and QPTH_AVAILABLE:
+                    # V5: Constrained QP subproblem
+                    d_v = self._constrained_sqp_step(
+                        x, H_v, grad_v, var_mask, valid_idx, n_valid,
+                        full_to_valid, member_mask, activity_mask,
+                        num_vehicles, member_is_adult, original_joint_prob,
+                    )
+                    if d_v is None:
+                        # Fallback to unconstrained Newton
+                        H_reg_v = H_v + 1e-3 * torch.eye(n_valid, device=device).unsqueeze(0)
+                        try:
+                            d_v = -torch.linalg.solve(H_reg_v, grad_v.unsqueeze(-1)).squeeze(-1)
+                        except Exception:
+                            d_v = -grad_v / (torch.diagonal(H_reg_v, dim1=-2, dim2=-1) + 1e-6)
+                else:
+                    # Original unconstrained Newton step
+                    H_reg_v = H_v + 1e-3 * torch.eye(n_valid, device=device).unsqueeze(0)
+                    try:
+                        d_v = -torch.linalg.solve(H_reg_v, grad_v.unsqueeze(-1)).squeeze(-1)
+                    except Exception:
+                        d_v = -grad_v / (torch.diagonal(H_reg_v, dim1=-2, dim2=-1) + 1e-6)
 
                 # Expand back to full dimension
                 d = torch.zeros(B, n, device=device)
@@ -716,6 +917,8 @@ class NashBargainingSQPOptNet(nn.Module):
                     x, d, var_mask, member_mask, activity_mask,
                     member_is_adult, out_of_home_prob, expected_tt,
                     num_vehicles=num_vehicles, original_joint_prob=original_joint_prob,
+                    ctx_params_detached=ctx_params_detached,
+                    dynamic_baseline_detached=dynamic_baseline_detached,
                 )
 
                 # Update & project
@@ -732,6 +935,234 @@ class NashBargainingSQPOptNet(nn.Module):
                     break
 
         return x
+
+    def _constrained_sqp_step(
+        self,
+        x: Tensor,             # [B, n]
+        H_v: Tensor,           # [B, n_valid, n_valid]
+        grad_v: Tensor,        # [B, n_valid]
+        var_mask: Tensor,      # [B, n]
+        valid_idx: Tensor,     # [n] bool
+        n_valid: int,
+        full_to_valid: Tensor, # [n] long
+        member_mask: Tensor,
+        activity_mask: Tensor,
+        num_vehicles: Tensor,
+        member_is_adult: Tensor,
+        original_joint_prob: Optional[Tensor],
+    ) -> Optional[Tensor]:
+        """Solve constrained QP subproblem for SQP step direction.
+
+        min 0.5 d'H d + g'd
+        s.t. G(x+d) ≤ h_ub  →  G d ≤ h_ub - G x
+             A(x+d) = b_rhs  →  A d = b_rhs - A x
+
+        Returns d_v [B, n_valid] or None if QP fails.
+        """
+        B = x.shape[0]
+        device = x.device
+
+        try:
+            G_v, h_ub, A_v, b_rhs = self._build_sqp_subproblem_constraints(
+                x, var_mask, valid_idx, n_valid, full_to_valid,
+                member_mask, activity_mask,
+                num_vehicles, member_is_adult, original_joint_prob,
+            )
+
+            # Regularize Hessian
+            H_reg = H_v + 1e-3 * torch.eye(n_valid, device=device).unsqueeze(0)
+
+            # Remove inactive equality rows
+            if A_v.shape[1] > 0:
+                active_eq = A_v.abs().sum(dim=(0, 2)) > 1e-12
+                A_v = A_v[:, active_eq]
+                b_rhs = b_rhs[:, active_eq]
+
+            # QR rank filter for equality constraints
+            if A_v.shape[1] > 0:
+                try:
+                    _, R = torch.linalg.qr(A_v[0].double().T)
+                    diag_R = torch.abs(torch.diag(R))
+                    indep_mask = diag_R > 1e-8
+                    if indep_mask.sum() < A_v.shape[1]:
+                        A_v = A_v[:, indep_mask]
+                        b_rhs = b_rhs[:, indep_mask]
+                except Exception:
+                    pass
+
+            # Remove inactive inequality rows
+            if G_v.shape[1] > 0:
+                active_ineq = G_v.abs().sum(dim=(0, 2)) > 1e-12
+                G_v = G_v[:, active_ineq]
+                h_ub = h_ub[:, active_ineq]
+
+            # Relax bounds slightly for feasibility
+            if h_ub.shape[1] > 0:
+                h_ub = h_ub + 1e-4
+
+            # Solve QP
+            d_v = QPFunction(verbose=False, maxIter=100, eps=1e-6)(
+                H_reg.double(), grad_v.double(),
+                G_v.double(), h_ub.double(),
+                A_v.double(), b_rhs.double(),
+            ).float()
+
+            # NaN/Inf check
+            if torch.isnan(d_v).any() or torch.isinf(d_v).any():
+                return None
+
+            # Clamp to prevent extreme steps
+            d_v = d_v.clamp(-5.0, 5.0)
+            return d_v
+
+        except Exception:
+            return None  # Fallback to unconstrained
+
+    def _build_sqp_subproblem_constraints(
+        self,
+        x: Tensor,              # [B, n]
+        var_mask: Tensor,       # [B, n]
+        valid_idx: Tensor,      # [n] bool
+        n_valid: int,
+        full_to_valid: Tensor,  # [n] long
+        member_mask: Tensor,    # [B, M]
+        activity_mask: Tensor,  # [B, M, T]
+        num_vehicles: Tensor,   # [B]
+        member_is_adult: Tensor, # [B, M]
+        original_joint_prob: Optional[Tensor],  # [B, M, T]
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Build constraints for SQP QP subproblem.
+
+        Same constraint structure as _build_optnet_constraints, but RHS is:
+          G d ≤ h_ub - G x_valid  (where h_ub is the absolute upper bound)
+          A d = b_target - A x_valid  (where b_target is the absolute target)
+        """
+        B, n = x.shape
+        device = x.device
+        M = self.max_members
+        T = self.max_activities
+        K = self.num_modes
+        V = self.vars_per_activity
+
+        G_list = []
+        h_list = []
+        A_list = []
+        b_list = []
+
+        x_valid = x[:, valid_idx]  # [B, n_valid]
+
+        # ---- 1. Bound constraints ----
+        I_v = torch.eye(n_valid, device=device).unsqueeze(0).expand(B, -1, -1)
+        lb_valid = self.lb_template[valid_idx].unsqueeze(0).expand(B, -1)
+        ub_valid = self.ub_template[valid_idx].unsqueeze(0).expand(B, -1)
+
+        # -d ≤ x - lb  →  -(x+d) ≤ -lb  →  d ≥ lb - x
+        G_list.append(-I_v)
+        h_list.append(x_valid - lb_valid)  # -d ≤ x - lb → h = x - lb
+        # d ≤ ub - x
+        G_list.append(I_v)
+        h_list.append(ub_valid - x_valid)  # d ≤ ub - x → h = ub - x
+
+        # ---- 2. Time ordering ----
+        time_G = self.time_G_template[:, valid_idx].unsqueeze(0).expand(B, -1, -1)
+        # Constraint: start ≤ end, end(t) ≤ start(t+1)
+        # G_time @ (x+d) ≤ 0  →  G_time @ d ≤ -G_time @ x
+        time_h_abs = torch.zeros(B, time_G.shape[1], device=device)
+        # G_time @ x_current
+        time_Gx = torch.bmm(time_G, x_valid.unsqueeze(-1)).squeeze(-1)  # [B, num_time_rows]
+        time_h = time_h_abs - time_Gx  # G d ≤ -G x
+        G_list.append(time_G)
+        h_list.append(time_h)
+
+        # ---- 3. Vehicle constraint (linearised) ----
+        x_4d = x.reshape(B, M, T, V)
+        driver_p0 = x_4d[..., 2 + K + 1]
+        car_p0 = x_4d[..., 2 + self.car_mode_indices[0]]
+
+        c0_flat = car_p0[:, self.veh_member_idx, self.veh_activity_idx]
+        d0_flat = driver_p0[:, self.veh_member_idx, self.veh_activity_idx]
+        adult_flat = member_is_adult[:, self.veh_member_idx]
+        valid_flat = activity_mask[:, self.veh_member_idx, self.veh_activity_idx]
+        weight = adult_flat * valid_flat
+
+        G_veh = torch.zeros(B, 1, n_valid, device=device)
+        mapped_drv = full_to_valid[self.veh_drv_idx]
+        mapped_car = full_to_valid[self.veh_car_idx]
+
+        drv_valid_mask = mapped_drv >= 0
+        if drv_valid_mask.any():
+            valid_drv_idx = mapped_drv[drv_valid_mask]
+            G_veh[:, 0, :].scatter_add_(
+                1, valid_drv_idx.unsqueeze(0).expand(B, -1),
+                (c0_flat * weight)[:, drv_valid_mask],
+            )
+        car_valid_mask = mapped_car >= 0
+        if car_valid_mask.any():
+            valid_car_idx = mapped_car[car_valid_mask]
+            G_veh[:, 0, :].scatter_add_(
+                1, valid_car_idx.unsqueeze(0).expand(B, -1),
+                (d0_flat * weight)[:, car_valid_mask],
+            )
+
+        current_usage = (
+            driver_p0 * car_p0 * member_is_adult.unsqueeze(-1) * activity_mask
+        ).sum(dim=(1, 2))
+        # G_veh @ d ≤ num_vehicles - current_usage
+        h_veh = (num_vehicles - current_usage).unsqueeze(-1)
+        G_list.append(G_veh)
+        h_list.append(h_veh)
+
+        # ---- 4. Mode normalisation (equality) ----
+        A_mode = self.A_mode_template[:, valid_idx].unsqueeze(0).expand(B, -1, -1)
+        # A_mode @ (x+d) = 1  →  A_mode @ d = 1 - A_mode @ x
+        # But since mode probs already sum to ~1 at x, b ≈ 0
+        mode_sum_current = torch.bmm(A_mode, x_valid.unsqueeze(-1)).squeeze(-1)  # [B, M*T]
+        b_mode = 1.0 - mode_sum_current  # target sum = 1
+        A_list.append(A_mode)
+        b_list.append(b_mode)
+
+        # ---- 5. Joint travel consistency ----
+        if self.num_pairs > 0:
+            joint_prob_conv = original_joint_prob if original_joint_prob is not None else x_4d[..., 2 + K]
+
+            jp_m1 = joint_prob_conv[:, self.pair_m1, self.pair_t]
+            jp_m2 = joint_prob_conv[:, self.pair_m2, self.pair_t]
+            jp_product = jp_m1 * jp_m2
+            active_raw = torch.sigmoid(10.0 * (jp_product - self.joint_consistency_threshold))
+            active = (active_raw > 0.1).float()
+
+            pair_active = active.abs().sum(dim=0) > 0
+
+            if pair_active.any():
+                active_pair_idx = pair_active.nonzero(as_tuple=True)[0]
+                row_idx = (active_pair_idx.unsqueeze(1) * self.rows_per_pair +
+                           torch.arange(self.rows_per_pair, device=device)).reshape(-1)
+
+                joint_A_sub = self.joint_A_template[row_idx][:, valid_idx]
+                active_sub = active[:, active_pair_idx]
+                active_exp_sub = active_sub.unsqueeze(-1).expand(
+                    -1, -1, self.rows_per_pair
+                ).reshape(B, -1)
+
+                joint_A = joint_A_sub.unsqueeze(0).expand(B, -1, -1) * active_exp_sub.unsqueeze(-1)
+
+                # A @ (x+d) = 0  →  A @ d = -A @ x  (target: m1 vars = m2 vars)
+                joint_Ax = torch.bmm(
+                    joint_A,
+                    x_valid.unsqueeze(-1)
+                ).squeeze(-1)  # [B, n_active_rows]
+                joint_b = -joint_Ax  # target is 0 difference
+
+                A_list.append(joint_A)
+                b_list.append(joint_b)
+
+        # ---- Combine ----
+        G = torch.cat(G_list, dim=1)
+        h = torch.cat(h_list, dim=1)
+        A = torch.cat(A_list, dim=1) if A_list else torch.zeros(B, 0, n_valid, device=device)
+        b = torch.cat(b_list, dim=1) if b_list else torch.zeros(B, 0, device=device)
+
+        return G, h, A, b
 
     def _bfgs_update(self, H: Tensor, s: Tensor, y: Tensor) -> Tensor:
         """Vectorized BFGS Hessian approximation update with Powell's damping.
@@ -797,14 +1228,20 @@ class NashBargainingSQPOptNet(nn.Module):
         self, x, d, var_mask, member_mask, activity_mask,
         member_is_adult, out_of_home_prob, expected_tt,
         num_vehicles=None, original_joint_prob=None,
+        ctx_params_detached=None, dynamic_baseline_detached=None,
     ) -> Tensor:
         """Armijo backtracking line search."""
         B = x.shape[0]
         device = x.device
 
-        utilities = self._compute_member_utilities(
+        utilities = self._compute_member_utilities_detached(
             x, member_mask, activity_mask, member_is_adult,
             out_of_home_prob, expected_tt,
+            self.alpha_joint.detach(), self.alpha_social.detach(),
+            self.theta_escort.detach(), self.utility_baseline.detach(),
+            self.theta_travel.detach(), self.theta_joint_cost.detach(),
+            ctx_params_detached=ctx_params_detached,
+            dynamic_baseline_detached=dynamic_baseline_detached,
         )
         f0 = -self._compute_nash_welfare(utilities, member_mask)
 
@@ -817,9 +1254,14 @@ class NashBargainingSQPOptNet(nn.Module):
                 activity_mask=activity_mask, original_joint_prob=original_joint_prob,
                 member_mask=member_mask,
             )
-            utils_new = self._compute_member_utilities(
+            utils_new = self._compute_member_utilities_detached(
                 x_new, member_mask, activity_mask, member_is_adult,
                 out_of_home_prob, expected_tt,
+                self.alpha_joint.detach(), self.alpha_social.detach(),
+                self.theta_escort.detach(), self.utility_baseline.detach(),
+                self.theta_travel.detach(), self.theta_joint_cost.detach(),
+                ctx_params_detached=ctx_params_detached,
+                dynamic_baseline_detached=dynamic_baseline_detached,
             )
             f_new = -self._compute_nash_welfare(utils_new, member_mask)
 
@@ -971,6 +1413,8 @@ class NashBargainingSQPOptNet(nn.Module):
         out_of_home_prob: Tensor,
         expected_tt: Tensor,
         original_joint_prob: Optional[Tensor] = None,
+        ctx_params: Optional[Dict[str, Tensor]] = None,  # V5
+        dynamic_baseline: Optional[Tensor] = None,         # V5
     ) -> Tensor:
         """OptNet phase: solve reduced-dimension QP with gradient through θ_packed.
 
@@ -992,6 +1436,8 @@ class NashBargainingSQPOptNet(nn.Module):
         utilities = self._compute_member_utilities(
             x_converged.detach(), member_mask, activity_mask,
             member_is_adult, out_of_home_prob, expected_tt,
+            ctx_params=ctx_params,
+            dynamic_baseline=dynamic_baseline,
         )  # [B, M] — carries grad through params
 
         inv_U    = 1.0 / utilities.clamp(min=1.0)              # [B, M]
@@ -1308,4 +1754,11 @@ def create_nash_layer_from_config(config) -> NashBargainingSQPOptNet:
         car_mode_indices=nc.get('car_mode_indices', [7]),
         sqp_max_iter=nc.get('sqp_max_iter', 15),
         sqp_tol=nc.get('sqp_tol', 1e-4),
+        # V5 parameters
+        use_context_params=nc.get('use_context_params', True),
+        context_hidden_dim=nc.get('context_hidden_dim', 64),
+        family_dim=getattr(config, 'family_dim', 10),
+        member_dim=getattr(config, 'member_dim', 51),
+        use_dynamic_baseline=nc.get('use_dynamic_baseline', True),
+        use_constrained_sqp=nc.get('use_constrained_sqp', True),
     )

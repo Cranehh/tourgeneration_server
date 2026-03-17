@@ -386,9 +386,33 @@ class ScheduledSamplingTrainer:
     def load_checkpoint(self, filepath: str):
         """加载检查点"""
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        # Handle missing keys from new V5 components (UtilityParameterNet, etc.)
+        ckpt_sd = checkpoint['model_state_dict']
+        model_sd = self.model.state_dict()
+        missing_in_ckpt = [k for k in model_sd if k not in ckpt_sd]
+        extra_in_ckpt = [k for k in ckpt_sd if k not in model_sd]
+
+        if missing_in_ckpt:
+            logger.info(f"New params not in checkpoint (will use init values): {len(missing_in_ckpt)} keys")
+            for k in missing_in_ckpt:
+                if 'utility_param_net' in k:
+                    logger.info(f"  [UtilityParameterNet] {k}")
+        if extra_in_ckpt:
+            logger.info(f"Checkpoint params not in model (will be ignored): {len(extra_in_ckpt)} keys")
+
+        # Load with strict=False to allow new parameters
+        self.model.load_state_dict(ckpt_sd, strict=False)
+
+        # Load optimizer/scheduler state — handle param count mismatch from new modules
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Optimizer state mismatch (new params added), reinitializing optimizer: {e}")
+        try:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Scheduler state mismatch, reinitializing scheduler: {e}")
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
@@ -403,7 +427,7 @@ class ScheduledSamplingTrainer:
             logger.info(f"Overrode nash utility_baseline to {nash.utility_baseline.item():.1f}")
 
             # Initialize theta_joint_cost if missing from old checkpoint
-            if 'decoder.nash_layer.theta_joint_cost' not in checkpoint.get('model_state_dict', {}):
+            if 'decoder.nash_layer.theta_joint_cost' not in ckpt_sd:
                 init_val = self.model_config.nash_config.get('theta_joint_cost', -0.5)
                 nash.theta_joint_cost = nn.Parameter(torch.tensor(init_val, device=self.device))
                 logger.info(f"Initialized new theta_joint_cost={init_val} (not in checkpoint)")
@@ -569,7 +593,7 @@ def main():
         train_config=train_config,
         train_loader=train_loader,
         val_loader=val_loader,
-        save_dir='../checkpoints_ss_with_condition_nash_without_end4',
+        save_dir='../checkpoints_ss_with_condition_nash_without_end5',
         eb_strategy='aggressive'  # 可选: 'aggressive', 'conservative'
     )
 

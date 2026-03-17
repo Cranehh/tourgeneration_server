@@ -80,6 +80,11 @@ class ModelConfig:
         'joint_consistency_threshold': 0.5,
         'car_mode_indices': [7],
         'theta_joint_cost': -0.5,
+        # V5 improvements
+        'use_context_params': True,          # Context-aware utility parameters via MLP
+        'context_hidden_dim': 64,            # MLP hidden dimension
+        'use_dynamic_baseline': True,        # Dynamic disagreement point
+        'use_constrained_sqp': True,         # Constrained QP in SQP subproblems
     })
     nash_bargaining_start_epoch: int = 3  # 从第几个epoch开始使用Nash Bargaining（调低以快速验证）
 

@@ -994,6 +994,8 @@ class MTANDecoder(nn.Module):
             home_zone=batch.home_zones,
             member_is_adult=member_is_adult,
             travel_time_matrix=self.travel_time_matrix,
+            family_attr=batch.family_attr,
+            member_attr=batch.member_attr,
         )
 
     def forward(
