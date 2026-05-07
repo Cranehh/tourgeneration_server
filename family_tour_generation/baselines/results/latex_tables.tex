@@ -1,0 +1,64 @@
+% ===== Table 1: SRMSE 主表 =====
+\begin{table}[t]
+\centering
+\caption{SRMSE comparison across baselines (lower is better)}
+\label{tab:srmse}
+\begin{tabular}{lrrrrr}
+\toprule
+model & SRMSE\_4D & SRMSE\_5D\_purpose & SRMSE\_5D\_mode & SRMSE\_8D\_full & family\_SRMSE \\
+\midrule
+Ours (with Nash) & 1.695 & 1.816 & 1.864 & 1.952 & 1.480 \\
+Ours (w/o Nash) & 1.670 & 2.021 & 2.002 & 2.135 & 2.181 \\
+CGAN & 28.912 & 29.570 & 29.409 & 30.059 & 4.632 \\
+CWGAN-GP & 31.551 & 32.272 & 32.108 & 32.829 & 4.317 \\
+CVAE & 31.665 & 32.415 & 32.216 & 32.949 & 4.168 \\
+GAN & 52.206 & 53.541 & 53.188 & 54.517 & 3.707 \\
+WGAN-GP & 55.077 & 56.565 & 56.176 & 57.667 & 3.876 \\
+VAE & 52.797 & 54.168 & 53.797 & 55.171 & 4.299 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===== Table 2: Family coordination =====
+\begin{table}[t]
+\centering
+\caption{Family-level coordination metrics. P\_joint = joint trip ratio; V\_vio = vehicle constraint violation rate; H\_vio = home-anchor violation rate; P\_pc = parent-with-children joint trip rate.}
+\label{tab:family_coord}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+model & P\_joint & V\_vio & H\_vio & P\_pc & P\_chap & n\_tour & mean\_joint\_size & P\_overlap \\
+\midrule
+Real & 0.032 & 0.000 & 0.012 & 0.112 & 0.502 & 1.523 & 1.758 & 0.299 \\
+Ours (with Nash) & 0.011 & 0.000 & 0.031 & 0.041 & 0.377 & 1.685 & 1.353 & 0.374 \\
+Ours (w/o Nash) & 0.009 & 0.173 & 0.030 & 0.092 & 0.122 & 1.670 & 1.387 & 0.411 \\
+CGAN & 0.021 & 0.001 & 0.996 & 0.104 & 0.004 & 0.008 & 1.080 & 0.159 \\
+CWGAN-GP & 0.002 & 0.000 & 0.998 & 0.019 & 0.022 & 0.005 & 1.027 & 0.196 \\
+CVAE & 0.006 & 0.000 & 0.992 & 0.022 & 0.012 & 0.017 & 1.117 & 0.204 \\
+GAN & 0.001 & 0.000 & 0.998 & 0.003 & — & 0.004 & 1.000 & 0.023 \\
+WGAN-GP & 0.002 & 0.000 & 0.998 & 0.010 & 0.027 & 0.005 & 1.000 & 0.047 \\
+VAE & 0.007 & 0.000 & 0.998 & 0.007 & 0.000 & 0.004 & 1.079 & 0.096 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===== Table 3: Trip length stats =====
+\begin{table}[t]
+\centering
+\caption{Trip length statistics (standardized OD distance)}
+\label{tab:trip_length}
+\begin{tabular}{lrrrrr}
+\toprule
+model & mean & std & p50 & p90 & n\_trips \\
+\midrule
+Real & -1.302 & 0.355 & -1.441 & -0.922 & 10921.000 \\
+Ours (with Nash) & -1.310 & 0.295 & -1.433 & -0.938 & 8963.000 \\
+Ours (w/o Nash) & -1.307 & 0.304 & -1.438 & -0.919 & 9204.000 \\
+CGAN & -0.587 & 0.803 & -0.787 & 0.379 & 13214.000 \\
+CWGAN-GP & -0.485 & 0.866 & -0.704 & 0.590 & 12865.000 \\
+CVAE & -0.759 & 0.700 & -0.941 & 0.058 & 12946.000 \\
+GAN & -0.615 & 0.730 & -0.783 & 0.307 & 10467.000 \\
+WGAN-GP & -0.455 & 0.791 & -0.631 & 0.537 & 9925.000 \\
+VAE & -0.757 & 0.751 & -0.973 & 0.123 & 10337.000 \\
+\bottomrule
+\end{tabular}
+\end{table}

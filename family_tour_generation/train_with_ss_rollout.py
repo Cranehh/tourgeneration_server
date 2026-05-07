@@ -77,8 +77,9 @@ class ScheduledSamplingTrainer:
         )
 
         # 学习率调度
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10, T_mult=2
+        # CosineAnnealingLR，T_max=总epoch数+1（恢复训练时在load_checkpoint中重新初始化）
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=train_config.num_epochs + 1, eta_min=0
         )
 
         # 混合精度
@@ -409,10 +410,15 @@ class ScheduledSamplingTrainer:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except (ValueError, KeyError) as e:
             logger.warning(f"Optimizer state mismatch (new params added), reinitializing optimizer: {e}")
-        try:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        except (ValueError, KeyError) as e:
-            logger.warning(f"Scheduler state mismatch, reinitializing scheduler: {e}")
+        # 不加载旧scheduler状态 — 根据剩余epoch数重新初始化CosineAnnealingLR
+        remaining_epochs = self.train_config.num_epochs - checkpoint['epoch']
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.train_config.learning_rate
+            pg['initial_lr'] = self.train_config.learning_rate
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=remaining_epochs + 1, eta_min=0
+        )
+        logger.info(f"Initialized CosineAnnealingLR: lr={self.train_config.learning_rate}, T_max={remaining_epochs + 1}")
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
@@ -459,7 +465,7 @@ def main():
 
     train_config = TrainConfig(
         batch_size=100,
-        learning_rate=5e-5,
+        learning_rate=1e-5,
         num_epochs=500
     )
 
@@ -598,10 +604,10 @@ def main():
     )
 
     # 从 checkpoint 恢复训练
-    # resume_path = '../checkpoints_ss_with_condition_nash_without_end/checkpoint_epoch_249.pt'
-    # if Path(resume_path).exists():
-    #     trainer.load_checkpoint(resume_path)
-    #     print(f"Resumed from checkpoint: {resume_path}")
+    resume_path = '../checkpoints_ss_with_condition_nash_without_end5/checkpoint_epoch_449.pt'
+    if Path(resume_path).exists():
+        trainer.load_checkpoint(resume_path)
+        print(f"Resumed from checkpoint: {resume_path}")
 
     # 训练
     trainer.train()

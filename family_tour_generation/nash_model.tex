@@ -64,7 +64,8 @@ The utility of member~$m$ is defined as:
 \begin{split}
     U_m(\mathbf{x}) ={} & \beta_0
     + \alpha_{\mathrm{social}} \sum_{t=1}^{T} \tilde{o}_{m,t} \, a_{m,t}
-    + \alpha_{\mathrm{joint}} \sum_{t=1}^{T} j_{m,t} \, a_{m,t} \\
+    + \alpha_{\mathrm{joint}} \sum_{t=1}^{T} j_{m,t} \, a_{m,t}
+    + \theta_{\mathrm{joint\_cost}} \sum_{t=1}^{T} j_{m,t}^2 \, a_{m,t} \\
     & + \theta_{\mathrm{escort}} \sum_{t=1}^{T} d_{m,t} \,(e_{m,t} - s_{m,t})\, a_{m,t} \, \indicator_{\mathrm{adult}}(m) \\
     & + \sum_{t=1}^{T} \tilde{o}_{m,t} \left( \sum_{k=1}^{K} p^{\mathrm{mode}}_{m,t,k} \, \theta_{\mathrm{travel},k} \, \E[\mathrm{TT}_{m,t,k}] \right) a_{m,t},
 \end{split}
@@ -75,6 +76,7 @@ where:
     \item $\beta_0$: learnable baseline utility,
     \item $\alpha_{\mathrm{social}}$: learnable social (out-of-home) preference weight,
     \item $\alpha_{\mathrm{joint}}$: learnable joint travel preference weight,
+    \item $\theta_{\mathrm{joint\_cost}}$: learnable quadratic joint coordination cost (typically negative),
     \item $\theta_{\mathrm{escort}}$: learnable escort burden coefficient (typically negative),
     \item $\theta_{\mathrm{travel},k}$: learnable mode-specific travel time disutility (vector of length $K$),
     \item $\tilde{o}_{m,t} = 1 - P(\mathrm{dest}_{m,t} = \mathrm{home})$: out-of-home probability from the destination head (fixed, not optimized),
@@ -82,6 +84,16 @@ where:
     \item $a_{m,t}$: activity validity mask ($1$ if activity~$t$ of member~$m$ is valid, $0$ otherwise),
     \item $\indicator_{\mathrm{adult}}(m)$: indicator for adult members.
 \end{itemize}
+
+\paragraph{Quadratic joint coordination cost.}
+The quadratic term $\theta_{\mathrm{joint\_cost}} \cdot j_{m,t}^2$ prevents corner solutions in the joint travel probability.
+With $\theta_{\mathrm{joint\_cost}} < 0$ (a cost) and $\alpha_{\mathrm{joint}} > 0$ (a benefit), the first-order condition for the optimal joint probability is:
+\begin{equation}
+    j^*_{m,t} = \frac{\alpha_{\mathrm{joint}}}{2\,|\theta_{\mathrm{joint\_cost}}|},
+    \label{eq:joint_interior}
+\end{equation}
+yielding an interior optimum rather than a boundary solution at~$0$ or~$1$.
+For example, with $\alpha_{\mathrm{joint}} = 0.1$ and $\theta_{\mathrm{joint\_cost}} = -0.5$, the unconstrained optimum is $j^* \approx 0.1$.
 
 \paragraph{Lower bound.}
 To ensure positivity for the log-utility in the Nash welfare function, a smooth lower bound is applied:
@@ -92,6 +104,88 @@ To ensure positivity for the log-utility in the Nash welfare function, a smooth 
 where $\softplus(z) = \log(1 + e^z)$.
 This guarantees $U_m \geq 1$ smoothly without gradient discontinuity.
 Utilities of invalid members are set to $\beta_0$ to avoid affecting the Nash objective.
+
+
+%% ====================================================================
+\section{V5: Context-Aware Utility Parameters}
+\label{sec:ctx_params}
+%% ====================================================================
+
+In the base model, the utility parameters $\alpha_{\mathrm{joint}}$, $\alpha_{\mathrm{social}}$, and $\theta_{\mathrm{escort}}$ are global scalars shared across all family members and activities.
+V5 introduces a \textbf{UtilityParameterNet} that predicts per-activity parameter values conditioned on the family context:
+\begin{equation}
+    \bigl[\alpha_{\mathrm{joint}}^{\mathrm{ctx}},\; \alpha_{\mathrm{social}}^{\mathrm{ctx}},\; \theta_{\mathrm{escort}}^{\mathrm{ctx}}\bigr]_{m,t}
+    = f_{\mathrm{MLP}}\!\bigl(\mathbf{f}_{\mathrm{family}},\; \mathbf{f}_{\mathrm{member},m},\; \mathbf{p}^{\mathrm{purpose}}_{m,t}\bigr),
+    \label{eq:ctx_params}
+\end{equation}
+where $\mathbf{f}_{\mathrm{family}} \in \R^{F_f}$ and $\mathbf{f}_{\mathrm{member},m} \in \R^{F_m}$ are the family and member attribute vectors, and $\mathbf{p}^{\mathrm{purpose}}_{m,t} \in \R^{10}$ is the predicted activity purpose probability (detached from the gradient graph).
+
+\paragraph{Network architecture.}
+The MLP consists of two linear layers with a single hidden layer of dimension~64:
+\begin{equation}
+    \R^{F_f + F_m + 10} \xrightarrow{\text{Linear}(64)} \xrightarrow{\text{ReLU}} \xrightarrow{\text{Dropout}(0.1)} \xrightarrow{\text{Linear}(3)} \R^{3}.
+    \label{eq:mlp_arch}
+\end{equation}
+The three outputs are transformed via activation functions that enforce the correct sign:
+\begin{align}
+    \alpha_{\mathrm{joint}}^{\mathrm{ctx}} &= \softplus(z_0) \times 0.5, \label{eq:ctx_joint} \\
+    \alpha_{\mathrm{social}}^{\mathrm{ctx}} &= \softplus(z_1) \times 0.5, \label{eq:ctx_social} \\
+    \theta_{\mathrm{escort}}^{\mathrm{ctx}} &= -\softplus(z_2), \label{eq:ctx_escort}
+\end{align}
+where $[z_0, z_1, z_2]$ are the raw MLP outputs.
+The $\softplus$ activation ensures $\alpha_{\mathrm{joint}}^{\mathrm{ctx}}, \alpha_{\mathrm{social}}^{\mathrm{ctx}} > 0$ (preferences) and $\theta_{\mathrm{escort}}^{\mathrm{ctx}} < 0$ (burden).
+
+\paragraph{Initialization.}
+The MLP weights are initialized with small magnitude ($\times 0.01$), and the output biases are set so that the initial predictions approximate the global parameter values.
+Specifically, for a target value $\alpha^*$ with activation $\softplus(b) \times 0.5 \approx \alpha^*$, the bias is initialized as $b = \log(\exp(2\alpha^*) - 1)$.
+This ensures the model starts near the baseline behavior and smoothly deviates as training progresses.
+
+\paragraph{Integration with utility function.}
+When context-aware parameters are enabled, the scalar parameters in Eq.~\eqref{eq:utility} are replaced by their per-activity counterparts:
+$\alpha_{\mathrm{social}} \to \alpha_{\mathrm{social},m,t}^{\mathrm{ctx}}$,
+$\alpha_{\mathrm{joint}} \to \alpha_{\mathrm{joint},m,t}^{\mathrm{ctx}}$,
+$\theta_{\mathrm{escort}} \to \theta_{\mathrm{escort},m,t}^{\mathrm{ctx}}$.
+The global scalar parameters remain in the model and serve as the initial reference point.
+
+\paragraph{Gradient flow.}
+During Phase~1 (SQP), the context-aware parameters are detached from the computation graph to avoid accumulating gradients through the non-differentiable SQP iterations.
+Gradients flow through the UtilityParameterNet only in Phase~2 (OptNet), via the $Q_{\mathrm{diag}}$ term in the diagonal KKT backward (Eq.~\ref{eq:grad_Q}):
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial \phi_{\mathrm{MLP}}}
+    = \frac{\partial \mathcal{L}}{\partial \mathbf{d}^*} \cdot \frac{\partial \mathbf{d}^*}{\partial Q_{\mathrm{diag}}} \cdot \frac{\partial Q_{\mathrm{diag}}}{\partial U_m^2} \cdot \frac{\partial U_m}{\partial \alpha^{\mathrm{ctx}}} \cdot \frac{\partial \alpha^{\mathrm{ctx}}}{\partial \phi_{\mathrm{MLP}}},
+    \label{eq:ctx_grad}
+\end{equation}
+where $\phi_{\mathrm{MLP}}$ denotes the MLP parameters.
+
+
+%% ====================================================================
+\section{V5: Dynamic Disagreement Point}
+\label{sec:dynamic_baseline}
+%% ====================================================================
+
+In the base model, the disagreement point (fallback utility when no agreement is reached) is a learnable scalar $\beta_0$ shared by all members.
+V5 replaces this with a \textbf{dynamic, per-member disagreement point} that reflects each member's utility under the decoder's original (uncoordinated) prediction:
+\begin{equation}
+    U^{\mathrm{base}}_m = U_m\!\bigl(\thetapacked\bigr), \quad
+    \beta_{0,m} = \max\!\bigl(U^{\mathrm{base}}_m,\; 1.0\bigr),
+    \label{eq:dynamic_baseline}
+\end{equation}
+where $\thetapacked$ is the decoder output packed into decision-variable format, and $U_m(\cdot)$ is the utility function (Eq.~\ref{eq:utility}).
+The $\max(\cdot, 1.0)$ clamp ensures the baseline utility is strictly positive, which is necessary for the log-utility in the Nash welfare function.
+
+\paragraph{Economic interpretation.}
+In Nash Bargaining theory, the disagreement point represents the outside option---the utility each player receives if negotiation fails.
+Setting it to $U_m(\thetapacked)$ means the ``no coordination'' outcome corresponds to the decoder's independent prediction for each member.
+The Nash Bargaining solution then only adjusts activities when doing so improves \emph{all} members above their uncoordinated baselines.
+
+\paragraph{Integration.}
+When dynamic baseline is enabled, the shared scalar $\beta_0$ in Eq.~\eqref{eq:utility} is replaced by the per-member value $\beta_{0,m}$, so the utility becomes:
+\begin{equation}
+    U_m(\mathbf{x}) = \beta_{0,m} + \alpha_{\mathrm{social}} \sum_t (\cdots) + \cdots
+    \label{eq:utility_dynamic}
+\end{equation}
+The Nash welfare objective retains the same form $W(\mathbf{x}) = \sum_{m=1}^{M} \log U_m(\mathbf{x})$, but the member-specific baseline $\beta_{0,m}$ changes the utility landscape: members with higher uncoordinated utility (larger $\beta_{0,m}$) have a higher floor, giving them more bargaining power in the Nash solution.
+The dynamic baseline is computed once (at the decoder output) and detached; it does not receive gradients.
 
 
 %% ====================================================================
@@ -123,18 +217,24 @@ subject to the constraints in Table~\ref{tab:phase1_constraints}.
 
 \begin{table}[ht]
 \centering
-\caption{Phase~1 constraints in variable space $\mathbf{x}$.}
+\caption{Phase~1 constraints in variable space $\mathbf{x}$.
+Constraints C1--C3 are enforced in all modes (via projection and, when enabled, in the SQP subproblem).
+Constraints C4--C5 are additionally included when V5 constrained SQP is enabled.}
 \label{tab:phase1_constraints}
-\begin{tabular}{@{}llc@{}}
+\begin{tabular}{@{}llcc@{}}
 \toprule
-Constraint & Formulation & Type \\
+Constraint & Formulation & Type & Mode \\
 \midrule
 (C1) Variable bounds &
-    $x_i^{\mathrm{lb}} \leq x_i \leq x_i^{\mathrm{ub}}$ & Linear \\[4pt]
+    $x_i^{\mathrm{lb}} \leq x_i \leq x_i^{\mathrm{ub}}$ & Linear (ineq) & All \\[4pt]
 (C2) Time ordering &
-    $e_{m,t} \geq s_{m,t}, \;\; s_{m,t+1} \geq e_{m,t}$ & Linear \\[4pt]
+    $e_{m,t} \geq s_{m,t}, \;\; s_{m,t+1} \geq e_{m,t}$ & Linear (ineq) & All \\[4pt]
 (C3) Mode simplex &
-    $\sum_{k=1}^{K} p^{\mathrm{mode}}_{m,t,k} = 1$ & Linear \\
+    $\sum_{k=1}^{K} p^{\mathrm{mode}}_{m,t,k} = 1$ & Linear (eq) & All \\[4pt]
+(C4) Vehicle capacity &
+    $\sum_{m,t} d_{m,t} \cdot p^{\mathrm{car}}_{m,t} \cdot \indicator_{\mathrm{adult}} \cdot a_{m,t} \leq n_{\mathrm{veh}}$ & Bilinear $\to$ linearized (ineq) & V5 \\[4pt]
+(C5) Joint consistency &
+    Gate-activated pairwise attribute matching & Nonlinear $\to$ gate-fixed (eq) & V5 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -147,19 +247,21 @@ The variable bounds (C1) are:
 \end{align}
 
 \paragraph{Scope of Phase~1 constraints.}
-Phase~1 handles only the simple per-variable and per-activity constraints (C1--C3) via projection.
-More complex family-level coordination constraints---vehicle capacity and joint travel consistency---involve nonlinear coupling between members and are \emph{not} enforced during Phase~1.
-These constraints are introduced in Phase~2 (\S\ref{sec:phase2}), where they are linearized at $\xconv$ and incorporated as explicit linear constraints in the QP formulation.
+In the original mode, Phase~1 handles only the per-variable and per-activity constraints (C1--C3) via projection after each SQP step.
+When V5 constrained SQP is enabled (\textsc{use\_constrained\_sqp}), all five constraints (C1--C5) are enforced within the QP subproblem at each SQP iteration (see~\S\ref{par:sqp_c4c5}).
+In this mode, the vehicle capacity constraint~(C4) is linearized at the current iterate~$\mathbf{x}^{(i)}$, and the joint consistency constraint~(C5) uses a sigmoid gate evaluated and fixed at~$\mathbf{x}^{(i)}$.
+In both modes, the projection operator additionally enforces vehicle and joint consistency heuristically (see Projection below).
+Phase~2 (\S\ref{sec:phase2}) re-expresses all five constraints in the displacement space $\mathbf{d} = \mathbf{x} - \xconv$, linearized at the converged point~$\xconv$.
 
 \subsection{SQP Algorithm}
 
-Phase~1 solves the NLP using Sequential Quadratic Programming (SQP) with BFGS inverse Hessian approximation. The constraints (C1--C3) are handled via projection after each step.
+Phase~1 solves the NLP using Sequential Quadratic Programming (SQP) with BFGS inverse Hessian approximation. In the original mode, constraints (C1--C3) are handled via projection after each step. In V5 constrained SQP mode, all five constraints (C1--C5) are enforced both in the QP subproblem and via projection.
 
 \begin{algorithm}[ht]
 \caption{Phase~1: SQP with BFGS and Armijo Line Search}
 \label{alg:sqp}
 \begin{algorithmic}[1]
-\Require Decoder output $\thetapacked$, masks, utility parameters
+\Require Decoder output $\thetapacked$, masks, utility parameters, context-aware parameters (V5, detached)
 \Ensure Converged point $\xconv$
 
 \State $\mathbf{x} \gets \thetapacked$ \Comment{Initialize at decoder output}
@@ -167,6 +269,7 @@ Phase~1 solves the NLP using Sequential Quadratic Programming (SQP) with BFGS in
 
 \For{$i = 0, \dots, I_{\max} - 1$}
     \State $\mathbf{g} \gets -\nabla_{\mathbf{x}} W(\mathbf{x})$ \Comment{Negative gradient of Nash welfare}
+    \If{$\mathbf{g}$ contains NaN} reset $\mathbf{x} \gets \thetapacked$; \textbf{break} \EndIf
     \If{$\|\mathbf{g}\| < \epsilon_{\mathrm{tol}}$} \textbf{break} \Comment{Converged} \EndIf
 
     \If{$i > 0$}
@@ -174,14 +277,76 @@ Phase~1 solves the NLP using Sequential Quadratic Programming (SQP) with BFGS in
         \State $H \gets \textsc{BFGS-Update}(H, \mathbf{s}, \mathbf{y})$ \Comment{With Powell's damping}
     \EndIf
 
-    \State $\mathbf{p} \gets -(H + \delta I) \, \mathbf{g}$ \Comment{Search direction; $\delta = 10^{-3}$}
+    \Statex \Comment{--- Search direction (V5 branching) ---}
+    \If{\textsc{use\_constrained\_sqp}} \Comment{V5: Constrained QP subproblem}
+        \State $\mathbf{p} \gets \arg\min_{\mathbf{d}} \; \frac{1}{2}\mathbf{d}^\top(H{+}\delta I)\mathbf{d} + \mathbf{g}^\top\mathbf{d} \;\;\text{s.t.}\;\; G\mathbf{d}{\leq}\mathbf{h}',\; A\mathbf{d}{=}\mathbf{b}'$ \Comment{Eq.~\eqref{eq:sqp_subqp}}
+        \If{QP fails or returns NaN} \Comment{Fallback}
+            \State $\mathbf{p} \gets -(H + \delta I) \, \mathbf{g}$
+        \EndIf
+    \Else \Comment{Original: unconstrained Newton step}
+        \State $\mathbf{p} \gets -(H + \delta I) \, \mathbf{g}$ \Comment{$\delta = 10^{-3}$}
+    \EndIf
+
     \State $\alpha \gets \textsc{Armijo-Search}(\mathbf{x}, \mathbf{p})$ \Comment{Backtracking line search}
-    \State $\mathbf{x} \gets \textsc{Project}(\mathbf{x} + \alpha\, \mathbf{p})$ \Comment{Project onto (C1)--(C3)}
+    \State $\mathbf{x} \gets \textsc{Project}(\mathbf{x} + \alpha\, \mathbf{p})$ \Comment{Project onto (C1)--(C3) + vehicle + joint}
+    \If{$\mathbf{x}$ contains NaN} reset $\mathbf{x} \gets \thetapacked$; \textbf{break} \EndIf
 \EndFor
 
 \State \Return $\xconv \gets \mathbf{x}$
 \end{algorithmic}
 \end{algorithm}
+
+\paragraph{V5: Constrained SQP subproblem.}
+When \textsc{use\_constrained\_sqp} is enabled, the search direction at each SQP iteration is obtained by solving a constrained QP subproblem:
+\begin{equation}
+    \min_{\mathbf{d}} \; \frac{1}{2}\mathbf{d}^\top (H + \delta I) \mathbf{d} + \mathbf{g}^\top \mathbf{d}
+    \quad\text{s.t.}\quad
+    G\mathbf{d} \leq \mathbf{h}' - G\mathbf{x}, \quad
+    A\mathbf{d} = \mathbf{b}' - A\mathbf{x},
+    \label{eq:sqp_subqp}
+\end{equation}
+where $G, \mathbf{h}', A, \mathbf{b}'$ encode all five constraints (C1--C5) expressed as linear constraints on the step~$\mathbf{d}$ at the current iterate~$\mathbf{x}$:
+C1 (bounds), C2 (time ordering), C3 (mode simplex), C4 (vehicle capacity, linearized), and C5 (joint consistency, gate-fixed).
+The detailed formulations of C4 and C5 in the SQP subproblem are given below (\S\ref{par:sqp_c4c5}).
+The inequality bounds are relaxed by $10^{-4}$ for numerical feasibility.
+QR rank filtering (as in Algorithm~\ref{alg:optnet}) is applied to the equality constraints before solving.
+If the QP solver fails or returns NaN/Inf values, the algorithm falls back to the unconstrained Newton direction $\mathbf{p} = -(H + \delta I)\mathbf{g}$ and relies on projection to maintain feasibility.
+
+\paragraph{SQP subproblem constraints C4--C5.}
+\label{par:sqp_c4c5}
+The SQP subproblem includes all five constraints.
+Constraints C1--C3 on the step~$\mathbf{d}$ take the same form as in Phase~2 (Eqs.~\ref{eq:bounds_d}--\ref{eq:mode_norm_d}), with $\xconv$ replaced by the current iterate~$\mathbf{x}^{(i)}$.
+Constraints C4 and C5 are formulated as follows.
+
+\subparagraph{(C4) Vehicle capacity (linearized at $\mathbf{x}^{(i)}$).}
+The vehicle constraint involves the bilinear product $d_{m,t} \cdot p^{\mathrm{car}}_{m,t}$, where both driver probability and car mode probability are decision variables.
+At the current iterate~$\mathbf{x}^{(i)}$, the constraint is linearized via first-order Taylor expansion:
+\begin{equation}
+    \sum_{m,t} \left( p^{\mathrm{car},(i)}_{m,t} \, d_{d_{m,t}} + d^{(i)}_{m,t} \, d_{p^{\mathrm{car}}_{m,t}} \right) \indicator_{\mathrm{adult}}(m) \, a_{m,t}
+    \leq n_{\mathrm{veh}} - \sum_{m,t} d^{(i)}_{m,t} \, p^{\mathrm{car},(i)}_{m,t} \, \indicator_{\mathrm{adult}}(m) \, a_{m,t},
+    \label{eq:vehicle_sqp}
+\end{equation}
+where superscript~$(i)$ denotes values at the current SQP iterate, $d_{d_{m,t}}$ and $d_{p^{\mathrm{car}}_{m,t}}$ are the step components for driver probability and car mode probability respectively, and $a_{m,t}$ is the activity validity mask.
+This contributes a single inequality row per sample.
+The key difference from the Phase~2 form (Eq.~\ref{eq:vehicle_d}) is that linearization occurs at the \emph{current} iterate~$\mathbf{x}^{(i)}$ (which changes each SQP step) rather than the fixed converged point~$\xconv$.
+
+\subparagraph{(C5) Joint travel consistency (gate-fixed at $\mathbf{x}^{(i)}$).}
+For each member pair $(m_1, m_2)$ and activity~$t$, a sigmoid gate determines whether joint consistency is enforced:
+\begin{equation}
+    w^{(i)}_{m_1,m_2,t} = \indicator\!\bigl[\sigma\!\bigl(10(j^{(i)}_{m_1,t} \cdot j^{(i)}_{m_2,t} - \tau)\bigr) > 0.1\bigr],
+    \label{eq:joint_gate_sqp}
+\end{equation}
+where $\tau = 0.5$ and superscript~$(i)$ denotes evaluation at the current iterate.
+For each active pair ($w^{(i)}_{m_1,m_2,t} = 1$), the step direction must drive the paired variables toward agreement:
+\begin{align}
+    d_{s_{m_1,t}} - d_{s_{m_2,t}} &= s^{(i)}_{m_2,t} - s^{(i)}_{m_1,t}, \label{eq:joint_start_sqp}\\
+    d_{e_{m_1,t}} - d_{e_{m_2,t}} &= e^{(i)}_{m_2,t} - e^{(i)}_{m_1,t}, \label{eq:joint_end_sqp}\\
+    d_{p^{\mathrm{mode}}_{m_1,t,k}} - d_{p^{\mathrm{mode}}_{m_2,t,k}} &= p^{\mathrm{mode},(i)}_{m_2,t,k} - p^{\mathrm{mode},(i)}_{m_1,t,k}, \quad \forall\, k, \label{eq:joint_mode_sqp}\\
+    d_{j_{m_1,t}} - d_{j_{m_2,t}} &= j^{(i)}_{m_2,t} - j^{(i)}_{m_1,t}. \label{eq:joint_prob_sqp}
+\end{align}
+Each active pair contributes $2 + K + 1 = 14$ equality rows.
+The right-hand sides ensure that $\mathbf{x}^{(i)} + \mathbf{d}$ yields equal attribute values for the paired members.
+Unlike Phase~2 (Eqs.~\ref{eq:joint_start_d}--\ref{eq:joint_prob_d}), the gate and linearization point are re-evaluated at each SQP iteration, allowing the active set of constrained pairs to evolve as the solution progresses.
 
 \paragraph{BFGS inverse Hessian update with Powell's damping.}
 The matrix $H$ approximates $[\nabla^2(-W)]^{-1}$, updated via the damped BFGS formula.
@@ -210,12 +375,14 @@ Starting from $\alpha = 1$, backtrack with factor $0.5$ until the sufficient dec
 where $c = 10^{-4}$ is the Armijo parameter.
 
 \paragraph{Projection.}
-The projection operator $\textsc{Project}(\cdot)$ enforces the linear constraints (C1)--(C3):
+The projection operator $\textsc{Project}(\cdot)$ enforces constraints (C1)--(C3) and heuristic versions of (C4)--(C5):
 \begin{enumerate}
-    \item Clamp times: $s_{m,t}, e_{m,t} \in [z_{\min}, z_{\max}]$.
-    \item Enforce temporal ordering: for $t = 1, \dots, T$ sequentially, set $s_{m,t} \geq e_{m,t-1}$ and $e_{m,t} \geq s_{m,t}$.
-    \item Project mode probabilities onto the simplex: clamp to $[\varepsilon, \infty)$ and renormalize.
+    \item \textbf{(C1)} Clamp times: $s_{m,t}, e_{m,t} \in [z_{\min}, z_{\max}]$.
+    \item \textbf{(C2)} Enforce temporal ordering: for $t = 1, \dots, T$ sequentially, set $s_{m,t} \geq e_{m,t-1}$ and $e_{m,t} \geq s_{m,t}$.
+    \item \textbf{(C3)} Project mode probabilities onto the simplex: clamp to $[\varepsilon, \infty)$ and renormalize.
     \item Clamp $j_{m,t}, d_{m,t} \in [\varepsilon, 1-\varepsilon]$.
+    \item \textbf{(C4) Vehicle projection}: if $\sum_{m,t} d_{m,t} \cdot p^{\mathrm{car}}_{m,t} \cdot \indicator_{\mathrm{adult}}(m) \cdot a_{m,t} > n_{\mathrm{veh}}$, scale down $d_{m,t}$ proportionally so that the total driver usage equals $n_{\mathrm{veh}}$.
+    \item \textbf{(C5) Joint consistency projection} (2-member families): for each active joint pair (determined by the same sigmoid gate as Eq.~\ref{eq:joint_gate_sqp}), average the start time, end time, and mode probabilities of the two members. For families with 3 or more members, joint consistency is handled exclusively by the QP equality constraints.
 \end{enumerate}
 
 
@@ -226,7 +393,7 @@ The projection operator $\textsc{Project}(\cdot)$ enforces the linear constraint
 
 Phase~2 constructs a QP around the converged point $\xconv$ from Phase~1.
 The displacement variable is $\mathbf{d} = \mathbf{x} - \xconv$.
-The QP enforces two groups of constraints: (i)~the Phase~1 constraints (C1--C3) re-expressed in the displacement space, and (ii)~\textbf{new} family-level coordination constraints (C4--C5) that are introduced for the first time in Phase~2.
+The QP enforces the same five constraints (C1--C5) as V5 constrained SQP, but expressed in the displacement space $\mathbf{d}$ and linearized at the \emph{fixed} converged point~$\xconv$ (rather than the changing iterate~$\mathbf{x}^{(i)}$).
 
 \subsection{QP Formulation}
 
@@ -281,10 +448,9 @@ The temporal constraints $e_{m,t} \geq s_{m,t}$ and $s_{m,t+1} \geq e_{m,t}$ bec
 \end{align}
 These remain linear, as in Phase~1.
 
-\subsubsection*{New family-level coordination constraints (introduced in Phase~2)}
+\subsubsection*{Family-level coordination constraints}
 
-\paragraph{(C4) Vehicle capacity.}
-This constraint is introduced for the first time in Phase~2.
+\paragraph{(C4$'$) Vehicle capacity.}
 The vehicle capacity constraint $\sum_{m,t} d_{m,t} \cdot p^{\mathrm{car}}_{m,t} \cdot \indicator_{\mathrm{adult}}(m) \cdot a_{m,t} \leq n_{\mathrm{veh}}$ involves the bilinear product $d_{m,t} \cdot p^{\mathrm{car}}_{m,t}$ (both are decision variables), which cannot be directly included in a QP.
 It is linearized via first-order Taylor expansion around $\xconv$:
 \begin{equation}
@@ -293,8 +459,9 @@ It is linearized via first-order Taylor expansion around $\xconv$:
     \label{eq:vehicle_d}
 \end{equation}
 where superscript~$0$ denotes values at $\xconv$, and $\Delta$ denotes the displacement component.
-This linearization is valid locally around $\xconv$, which is why this constraint is enforced in Phase~2 (after convergence) rather than Phase~1.
+This linearization is valid locally around $\xconv$.
 It contributes a single linear inequality row.
+The same linearization structure is used in the SQP subproblem (Eq.~\ref{eq:vehicle_sqp}), but evaluated at the current iterate~$\mathbf{x}^{(i)}$ rather than~$\xconv$.
 
 \subsection{Equality Constraints: $A\mathbf{d} = \mathbf{b}$}
 
@@ -307,10 +474,9 @@ Since $\sum_k p^{\mathrm{mode}}_{m,t,k} = 1$ holds at $\xconv$, the displacement
     \label{eq:mode_norm_d}
 \end{equation}
 
-\subsubsection*{New family-level coordination constraint (introduced in Phase~2)}
+\subsubsection*{Joint travel coordination}
 
-\paragraph{(C5) Joint travel consistency.}
-This constraint is introduced for the first time in Phase~2.
+\paragraph{(C5$'$) Joint travel consistency.}
 When two members $m_1, m_2$ are both engaged in joint travel at activity~$t$, their activity attributes should agree.
 The activation is determined by a sigmoid gate evaluated at $\xconv$ and fixed as a binary decision:
 \begin{equation}
@@ -319,6 +485,7 @@ The activation is determined by a sigmoid gate evaluated at $\xconv$ and fixed a
 \end{equation}
 where $\tau = 0.5$ is the joint consistency threshold, $\sigma(\cdot)$ is the sigmoid function, and superscript $0$ denotes values at $\xconv$.
 The sigmoid of the bilinear product $j_{m_1,t} \cdot j_{m_2,t}$ is inherently nonlinear; evaluating it at $\xconv$ and fixing the result as a binary gate converts this into a fixed set of linear equalities suitable for the QP.
+The same gate structure is used in the SQP subproblem (Eq.~\ref{eq:joint_gate_sqp}), but evaluated at the current iterate~$\mathbf{x}^{(i)}$.
 
 For each active pair ($w_{m_1,m_2,t} = 1$):
 \begin{align}
@@ -336,17 +503,17 @@ Table~\ref{tab:linearization} summarizes the full constraint set in Phase~2.
 
 \begin{table}[ht]
 \centering
-\caption{Phase~2 constraint summary. Constraints C1--C3 are inherited from Phase~1; C4--C5 are new in Phase~2.}
+\caption{Phase~2 constraint summary. All five constraints from Phase~1 are re-expressed in displacement space $\mathbf{d} = \mathbf{x} - \xconv$.}
 \label{tab:linearization}
 \begin{tabular}{@{}llll@{}}
 \toprule
-Constraint & Phase~2 form & Origin & Linearization method \\
+Constraint & Phase~2 form & Space & Linearization method \\
 \midrule
-(C1$'$) Bounds & $G\mathbf{d} \leq \mathbf{h}$ & Phase~1 & Direct translation \\
-(C2$'$) Time ordering & $G\mathbf{d} \leq \mathbf{h}$ & Phase~1 & Direct translation \\
-(C3$'$) Mode simplex & $A\mathbf{d} = \mathbf{b}$ & Phase~1 & Conservation (zero-sum) \\
-(C4) Vehicle capacity & $G\mathbf{d} \leq \mathbf{h}$ & \textbf{New in Phase~2} & Taylor expansion at $\xconv$ \\
-(C5) Joint consistency & $A\mathbf{d} = \mathbf{b}$ & \textbf{New in Phase~2} & Sigmoid gate fixed at $\xconv$ \\
+(C1$'$) Bounds & $G\mathbf{d} \leq \mathbf{h}$ & $\mathbf{d}$ & Direct translation \\
+(C2$'$) Time ordering & $G\mathbf{d} \leq \mathbf{h}$ & $\mathbf{d}$ & Direct translation \\
+(C3$'$) Mode simplex & $A\mathbf{d} = \mathbf{b}$ & $\mathbf{d}$ & Conservation (zero-sum) \\
+(C4$'$) Vehicle capacity & $G\mathbf{d} \leq \mathbf{h}$ & $\mathbf{d}$ & Taylor expansion at $\xconv$ \\
+(C5$'$) Joint consistency & $A\mathbf{d} = \mathbf{b}$ & $\mathbf{d}$ & Sigmoid gate fixed at $\xconv$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -357,20 +524,26 @@ Constraint & Phase~2 form & Origin & Linearization method \\
 \caption{Phase~2: QP Solve with Gradient Re-attachment}
 \label{alg:optnet}
 \begin{algorithmic}[1]
-\Require $\xconv$, $\thetapacked$ (decoder output), masks, utility parameters
-\Ensure $\xfinal$ (with gradient to decoder and utility parameters)
+\Require $\xconv$, $\thetapacked$ (decoder output), masks, utility parameters, V5: context-aware parameters, dynamic baseline
+\Ensure $\xfinal$ (with gradient to decoder, utility parameters, and UtilityParameterNet)
 
 \Statex \textbf{--- Step 1: Construct QP parameters ---}
-\State $U_m \gets$ Eq.~\eqref{eq:utility} evaluated at $\xconv$
+\State $U_m \gets$ Eq.~\eqref{eq:utility} at $\xconv$ \Comment{V5: uses ctx\_params and dynamic baseline}
 \State $Q_{\mathrm{diag}} \gets 1/U_m^2 + \lambda$ \quad (expanded per variable via member mapping) \Comment{Eq.~\eqref{eq:Q}}
 \State $\mathbf{p} \gets \lambda(\xconv - \thetapacked)$ \Comment{Eq.~\eqref{eq:p}}
 
-\Statex \textbf{--- Step 2: Build constraints (C1$'$--C3$'$ inherited) ---}
-\State $(G, \mathbf{h}) \gets$ Eqs.~\eqref{eq:bounds_d}--\eqref{eq:vehicle_d} \Comment{C1$'$, C2$'$}
-\State $(A, \mathbf{b}) \gets$ Eqs.~\eqref{eq:mode_norm_d}--\eqref{eq:joint_prob_d} \Comment{C3$'$}
+\Statex \textbf{--- Step 2: Build constraints (C1$'$--C5) ---}
+\State $(G, \mathbf{h}) \gets$ Eqs.~\eqref{eq:bounds_d}--\eqref{eq:vehicle_d} \Comment{C1$'$, C2$'$, C4}
+\State $(A, \mathbf{b}) \gets$ Eqs.~\eqref{eq:mode_norm_d}--\eqref{eq:joint_prob_d} \Comment{C3$'$, C5}
 
-\Statex \textbf{--- Step 3: Solve QP ---}
+\Statex \textbf{--- Step 2.5: Constraint preprocessing ---}
+\State Remove all-zero rows from $A$ and $G$ \Comment{Inactive constraints for masked variables}
+\State $A \gets \textsc{QR-Rank-Filter}(A)$ \Comment{Eq.~\eqref{eq:qr_filter}; remove linearly dependent rows}
+\State $\mathbf{h} \gets \mathbf{h} + 10^{-4}$ \Comment{Slight relaxation for numerical feasibility}
+
+\Statex \textbf{--- Step 3: Solve QP (under \texttt{no\_grad}) ---}
 \State $\mathbf{d}^* \gets \arg\min_{\mathbf{d}} \; \tfrac{1}{2} \mathbf{d}^\top Q \mathbf{d} + \mathbf{p}^\top \mathbf{d} \;\;\text{s.t.}\;\; G\mathbf{d} \leq \mathbf{h},\; A\mathbf{d} = \mathbf{b}$
+\If{$\mathbf{d}^*$ contains NaN or Inf} $\mathbf{d}^* \gets \mathbf{0}$ \EndIf
 
 \Statex \textbf{--- Step 4: Re-attach gradient ---}
 \State $\mathbf{d}^* \gets \textsc{DiagonalKKTBackward}(\mathbf{p}, Q_{\mathrm{diag}}, \mathbf{d}^*)$ \Comment{See \S\ref{sec:kkt_backward}}
@@ -378,10 +551,20 @@ Constraint & Phase~2 form & Origin & Linearization method \\
 \Statex \textbf{--- Step 5: Assemble final output ---}
 \State $\xfinal \gets \thetapacked + (\xconv - \thetapacked)_{\mathrm{detach}} + \mathbf{d}^*$ \Comment{Eq.~\eqref{eq:x_final}}
 \State $\xfinal \gets \textsc{Project}(\xfinal)$
+\If{$\xfinal$ contains NaN} $\xfinal \gets \thetapacked$ \Comment{Full fallback} \EndIf
 
 \State \Return $\xfinal$
 \end{algorithmic}
 \end{algorithm}
+
+\paragraph{QR rank filtering.}
+Before passing the equality constraint matrix $A$ to the QP solver, linearly dependent rows are removed to prevent singular KKT systems.
+This is achieved via QR decomposition:
+\begin{equation}
+    A^\top = QR, \quad \text{keep row } i \text{ if } |R_{ii}| > 10^{-8}.
+    \label{eq:qr_filter}
+\end{equation}
+The filtering uses the first batch element (constraint structure is similar across the batch) and is applied to both Phase~1 constrained SQP subproblems and the Phase~2 QP.
 
 
 \subsection{Final Solution Assembly}
@@ -438,17 +621,21 @@ Table~\ref{tab:params} summarizes all parameters of the Nash Bargaining layer.
 
 \begin{table}[ht]
 \centering
-\caption{Parameters of the Nash Bargaining layer.}
+\caption{Parameters of the Nash Bargaining layer. Parameters marked with $^\dagger$ can be replaced by per-activity context-aware predictions from the UtilityParameterNet (\S\ref{sec:ctx_params}) when V5 is enabled.}
 \label{tab:params}
 \begin{tabular}{@{}lccl@{}}
 \toprule
 Parameter & Dim & Initial Value & Description \\
 \midrule
-$\beta_0$ & 1 & 2.0 & Baseline utility \\
-$\alpha_{\mathrm{social}}$ & 1 & 0.3 & Out-of-home social preference \\
-$\alpha_{\mathrm{joint}}$ & 1 & 0.1 & Joint travel preference \\
-$\theta_{\mathrm{escort}}$ & 1 & $-0.58$ & Escort burden (adults) \\
+$\beta_0$ & 1 & 2.0 & Baseline utility (V5: replaced by dynamic baseline, \S\ref{sec:dynamic_baseline}) \\
+$\alpha_{\mathrm{social}}^\dagger$ & 1 & 0.3 & Out-of-home social preference \\
+$\alpha_{\mathrm{joint}}^\dagger$ & 1 & 0.1 & Joint travel preference \\
+$\theta_{\mathrm{joint\_cost}}$ & 1 & $-0.5$ & Joint coordination cost (quadratic, Eq.~\ref{eq:joint_interior}) \\
+$\theta_{\mathrm{escort}}^\dagger$ & 1 & $-0.58$ & Escort burden (adults) \\
 $\theta_{\mathrm{travel}}$ & $K{=}11$ & $[-1.5, -0.4, \dots]$ & Mode-specific travel time disutility \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{V5: UtilityParameterNet (\S\ref{sec:ctx_params})}} \\
+$\phi_{\mathrm{MLP}}$ & $(F_f{+}F_m{+}10){\times}64{+}64{\times}3$ & $\approx$ global params & Context-aware parameter MLP \\
 \midrule
 $\lambda$ (fixed) & 1 & 0.3 & Anchor weight (not learned) \\
 \bottomrule
@@ -456,6 +643,7 @@ $\lambda$ (fixed) & 1 & 0.3 & Anchor weight (not learned) \\
 \end{table}
 
 All learnable parameters are updated via backpropagation through the diagonal KKT backward (Eqs.~\ref{eq:grad_p}--\ref{eq:grad_Q}).
+The UtilityParameterNet parameters $\phi_{\mathrm{MLP}}$ receive gradients through the $Q_{\mathrm{diag}} \to 1/U_m^2 \to U_m \to \alpha^{\mathrm{ctx}}$ path (Eq.~\ref{eq:ctx_grad}).
 The anchor weight $\lambda$ is a fixed hyperparameter controlling the trade-off between Nash coordination and fidelity to the decoder output.
 
 
@@ -475,8 +663,17 @@ The anchor weight $\lambda$ is a fixed hyperparameter controlling the trade-off 
 Gradient flows from loss $\to$ unpack $\to$ $\xfinal$ $\to$ $\mathbf{d}^*$ $\to$
 \begin{itemize}
     \item $\mathbf{p} \to \thetapacked \to$ decoder parameters,
-    \item $Q_{\mathrm{diag}} \to 1/U_m^2 \to$ learnable utility parameters.
+    \item $Q_{\mathrm{diag}} \to 1/U_m^2 \to U_m \to$ learnable utility parameters ($\alpha_{\mathrm{joint}}, \alpha_{\mathrm{social}}, \theta_{\mathrm{escort}}, \theta_{\mathrm{joint\_cost}}, \beta_0, \theta_{\mathrm{travel}}$).
 \end{itemize}
+
+\paragraph{V5 additional gradient paths.}
+When context-aware parameters and dynamic baseline are enabled, two additional paths emerge:
+\begin{itemize}
+    \item $Q_{\mathrm{diag}} \to 1/U_m^2 \to U_m \to \alpha^{\mathrm{ctx}} \to \phi_{\mathrm{MLP}}$ (UtilityParameterNet parameters, Eq.~\ref{eq:ctx_grad}),
+    \item $Q_{\mathrm{diag}} \to 1/U_m^2 \to U_m \to \theta_{\mathrm{joint\_cost}}$ (quadratic joint cost parameter).
+\end{itemize}
+Note that context-aware parameters are \emph{detached} during Phase~1 (SQP); their gradients flow exclusively through Phase~2 (OptNet).
+The dynamic baseline $\beta_{0,m}$ is also detached (computed once at the decoder output) and does not receive gradients directly, but it influences the $Q_{\mathrm{diag}}$ values and thereby the optimization landscape.
 
 
 \end{document}
